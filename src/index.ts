@@ -1687,6 +1687,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// 4. Capture context for abort handling
 	const abortCtx = queryCtx;
+	let abortedSessionId: string | undefined;
 
 	const requestAbort = () => {
 		// interrupt() asks the CLI to stop gracefully; close() kills it immediately.
@@ -1696,6 +1697,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	};
 	const onAbort = () => {
 		wasAborted = true;
+		abortedSessionId ??= sharedSession?.sessionId;
+		// The next turn must not reuse a file the dying child can still write.
+		if (sharedSession && sharedSession.sessionId === abortedSessionId) {
+			sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+		}
 		drainForAbort(abortCtx, promptStream);
 		requestAbort();
 	};
@@ -1711,8 +1717,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 			// --- Abort detection in normal completion path ---
 			if (wasAborted || options?.signal?.aborted) {
-				if (sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
-				debug(`provider: abort detected, marked sharedSession needsRebuild + forceRotate`);
+				if (sharedSession && sharedSession.sessionId === abortedSessionId) {
+					sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+				}
+				debug(`provider: abort detected${sharedSession?.sessionId === abortedSessionId ? ", marked sharedSession needsRebuild + forceRotate" : ""}`);
 				if (queryCtx.turnOutput) {
 					queryCtx.turnOutput.stopReason = "aborted";
 					queryCtx.turnOutput.errorMessage = "Operation aborted";
@@ -1747,8 +1755,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		})
 		.catch((error) => {
 			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
-			if ((wasAborted || options?.signal?.aborted) && sharedSession) {
-				sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+			if (wasAborted || options?.signal?.aborted) {
+				if (sharedSession && sharedSession.sessionId === abortedSessionId) {
+					sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+				}
 			} else {
 				sharedSession = null;
 			}

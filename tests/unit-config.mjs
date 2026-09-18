@@ -9,13 +9,17 @@ import { claudeCodeSettings, loadConfig, markStartupNoticeShown } from "../src/c
 
 function withTempHome(fn) {
 	const oldHome = process.env.HOME;
+	const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const home = mkdtempSync(join(tmpdir(), "claude-bridge-home-"));
 	try {
 		process.env.HOME = home;
+		delete process.env.PI_CODING_AGENT_DIR;
 		return fn(home);
 	} finally {
 		if (oldHome === undefined) delete process.env.HOME;
 		else process.env.HOME = oldHome;
+		if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
 		rmSync(home, { recursive: true, force: true });
 	}
 }
@@ -31,6 +35,42 @@ describe("claudeCodeSettings", () => {
 });
 
 describe("loadConfig", () => {
+	it("expands a portable executable path after project overrides", () => withTempHome((home) => {
+		const cwd = mkdtempSync(join(tmpdir(), "claude-bridge-path-"));
+		try {
+			mkdirSync(getAgentDir(), { recursive: true });
+			writeFileSync(join(getAgentDir(), "claude-bridge.json"), JSON.stringify({
+				provider: { pathToClaudeCodeExecutable: "~/.claude/bin/claude" },
+			}));
+			assert.equal(loadConfig(cwd).provider.pathToClaudeCodeExecutable, join(home, ".claude/bin/claude"));
+			const projectDir = join(cwd, CONFIG_DIR_NAME);
+			mkdirSync(projectDir, { recursive: true });
+			for (const path of ["/custom/claude", "claude", "$HOME/claude", 42]) {
+				writeFileSync(join(projectDir, "claude-bridge.json"), JSON.stringify({ provider: { pathToClaudeCodeExecutable: path } }));
+				assert.equal(loadConfig(cwd).provider.pathToClaudeCodeExecutable, path);
+			}
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	}));
+
+	it("test config writes leave an inherited agent directory untouched", () => {
+		const inherited = mkdtempSync(join(tmpdir(), "claude-bridge-inherited-"));
+		const original = process.env.PI_CODING_AGENT_DIR;
+		try {
+			process.env.PI_CODING_AGENT_DIR = inherited;
+			const path = join(inherited, "claude-bridge.json");
+			writeFileSync(path, "{}");
+			withTempHome(() => markStartupNoticeShown());
+			assert.equal(readFileSync(path, "utf8"), "{}");
+			assert.equal(process.env.PI_CODING_AGENT_DIR, inherited);
+		} finally {
+			if (original === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = original;
+			rmSync(inherited, { recursive: true, force: true });
+		}
+	});
+
 	it("loads project config from Pi's configured project directory", () => withTempHome(() => {
 		const cwd = mkdtempSync(join(tmpdir(), "claude-bridge-project-"));
 		try {
