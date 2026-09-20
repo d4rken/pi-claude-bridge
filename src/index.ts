@@ -23,6 +23,7 @@ import {
 	collectPromptSkills,
 	projectPromptCapture,
 	PromptCaptures,
+	type PromptCapture,
 } from "./prompt-capture.js";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
@@ -769,6 +770,7 @@ export const __test = {
 	CC_CHILD_ENV,
 	buildMcpServers,
 	branchSummaryOutcome,
+	streamClaudeAgentSdk,
 };
 
 // --- Provider helpers: tool name mapping ---
@@ -1568,7 +1570,26 @@ function streamClaudeAgentSdk(model: Model<any>, input: ProviderInput, options?:
 	// `--no-skills` reach Claude Code by leaving nothing to forward. A sub-agent's
 	// custom override embeds its parent's assembled Pi prompt; recursive projection
 	// replaces that exact inherited prompt with its already-safe portable parts.
-	const promptCapture = promptCaptures.resolveOrDerive(context.systemPrompt);
+	let promptCapture: PromptCapture | undefined;
+	try {
+		promptCapture = promptCaptures.resolveOrDerive(context.systemPrompt);
+	} catch (err) {
+		// Refuse through the stream rather than by throwing. The resolver's contract is
+		// unchanged — an unaccountable prompt still fails its turn and reaches Claude
+		// Code never — but a low-level `agentLoop` caller reaches this provider from a
+		// detached promise, where a synchronous throw is an uncaughtException that ends
+		// the pi process rather than the turn. pi-agent-core normalizes a throw into a
+		// failed assistant message only for callers that own an AgentSession.
+		//
+		// Nothing has been claimed or reset at this point, so there is no half-built
+		// query to unwind; see the comment above resolveMcpTools.
+		const msg = errorMessage(err);
+		debug(`provider: refusing turn without a resolvable system prompt: ${msg}`);
+		stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
+		markStreamComplete(stream);
+		stream.end();
+		return stream;
+	}
 	const systemPromptAppend = promptCapture
 		? projectPromptCapture(promptCapture, {
 			skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
