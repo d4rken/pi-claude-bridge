@@ -162,7 +162,8 @@ export class PromptCaptures {
 				+ `Claude Code would receive none of this turn's context files, skills or custom instructions. `
 				+ `The usual cause is an extension loaded after claude-bridge that rewrites the system prompt from before_agent_start — `
 				+ `one that wraps it is fine, one that rebuilds or strips it leaves nothing to match. `
-				+ `(Also possible: pi rebuilt the prompt outside before_agent_start — a late-registered tool or fresh resource discovery.)`,
+				+ `(Also possible: pi rebuilt the prompt outside before_agent_start — a late-registered tool or fresh resource discovery — `
+				+ `or, on Pi 0.86, a prompt section added mid-session: the transcript replays it after the existing sections while before_agent_start renders it in canonical order.)`,
 			);
 		}
 

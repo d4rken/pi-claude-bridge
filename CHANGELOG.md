@@ -2,6 +2,7 @@
 
 ## UNRELEASED
 
+- **Fix: Pi 0.86 transcripts reach the provider with no prompt and no tools** — Pi 0.86 hands custom providers a normalized transcript: the system prompt and tool declarations travel as `role: "system"` messages, and `context.systemPrompt` / `context.tools` are gone. The provider now replays those messages with pi-ai's `getCurrentSystemPrompt` / `getCurrentTools` and strips them before any of its positional message handling, so prompt capture, tool bridging, session cursors and compaction summaries see the same shape as before. A 0.85 host still works: its field-based context passes through unchanged. Two limits remain: a prompt section that Pi first adds mid-session replays in a different order than `before_agent_start` renders it, which the provider refuses with its usual capture diagnostic; and a prompt or tool patch that lands while a Claude query is already running does not change that query.
 - **Bump: pin provider dependencies and align development with Pi 0.85.1** — Claude Agent SDK 0.3.267 handles early process exits without an uncaught stdin error. Refresh vulnerable locked dependencies and preserve registry integrity metadata.
 - **Fix: rotate aborted sessions before the SDK unwinds** — mark the session in the abort handler so an immediate next turn cannot reuse the dying child's file. Adapted from upstream PR #87, with an offline regression test.
 - **Add: portable Claude launcher paths** — expand a leading `~/` in `provider.pathToClaudeCodeExecutable`. AskClaude remains opt-in.

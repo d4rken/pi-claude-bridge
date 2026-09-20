@@ -18,6 +18,7 @@ import { extractAllToolResults as _extractAllToolResults, type McpResult } from 
 import { QueryContext, ctx } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
 import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
+import { readTranscript, setTranscriptHelpers, type ProviderInput } from "./transcript.js";
 import {
 	collectPromptSkills,
 	projectPromptCapture,
@@ -451,15 +452,15 @@ function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?
 	return `Claude rate limit${kind}${resets}: ${failure}`;
 }
 
-function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+function isolatedStreamFn(model: Model<any>, input: ProviderInput, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = newAssistantMessageEventStream();
-	void runIsolatedSummary(model, context, options, stream);
+	void runIsolatedSummary(model, input, options, stream);
 	return stream;
 }
 
 async function runIsolatedSummary(
 	model: Model<any>,
-	context: Context,
+	input: ProviderInput,
 	options: SimpleStreamOptions | undefined,
 	stream: AssistantMessageEventStream,
 ): Promise<void> {
@@ -472,6 +473,7 @@ async function runIsolatedSummary(
 	};
 
 	try {
+		const context = readTranscript(input);
 		const promptText = extractIsolatedSummaryPrompt(context.messages);
 		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 		const compactProviderSettings = loadConfig(cwd).provider;
@@ -756,6 +758,8 @@ export const __test = {
 		piUI = ui;
 	},
 	syncSharedSession,
+	setTranscriptHelpers,
+	isolatedStreamFn,
 	extractUserPromptBlocks,
 	consumeQuery,
 	finalizeCurrentStream,
@@ -1476,9 +1480,20 @@ function drainForAbort(c: QueryContext, promptStream: PromptStream): void {
 
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
  *  Two cases: tool result delivery (active query) or fresh query. */
-function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+function streamClaudeAgentSdk(model: Model<any>, input: ProviderInput, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	showStartupNoticeOnce();
 	const stream = newAssistantMessageEventStream();
+	// Folded before anything positional runs; a shape this host cannot replay fails
+	// the turn on the stream, where a detached low-level caller can see it.
+	let context: Context;
+	try {
+		context = readTranscript(input);
+	} catch (err) {
+		stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", errorMessage(err)) });
+		markStreamComplete(stream);
+		stream.end();
+		return stream;
+	}
 
 	// DEBUG: trace followUp message triggering
 	const lastMsgRole = context.messages[context.messages.length - 1]?.role;
@@ -2269,7 +2284,7 @@ export default function (pi: ExtensionAPI) {
 						model: params.model,
 						thinking: params.thinking,
 						isolated,
-						context: isolated ? undefined : buildSessionContext(ctx.sessionManager.getBranch()).messages as Context["messages"],
+						context: isolated ? undefined : readTranscript({ messages: buildSessionContext(ctx.sessionManager.getBranch()).messages as Context["messages"] }).messages,
 					});
 					clearInterval(progressInterval);
 					onUpdate?.({ content: [{ type: "text", text: "" }], details: {} });
