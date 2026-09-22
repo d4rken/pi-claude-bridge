@@ -8,6 +8,7 @@
 - **Bump: pin provider dependencies and align development with Pi 0.85.1** — Claude Agent SDK 0.3.267 handles early process exits without an uncaught stdin error. Refresh vulnerable locked dependencies and preserve registry integrity metadata.
 - **Fix: rotate aborted sessions before the SDK unwinds** — mark the session in the abort handler so an immediate next turn cannot reuse the dying child's file. Adapted from upstream PR #87, with an offline regression test.
 - **Add: portable Claude launcher paths** — expand a leading `~/` in `provider.pathToClaudeCodeExecutable`. AskClaude remains opt-in.
+- **Tests: `npm test` runs under a POSIX `sh`** — the script sourced `.env.test` as a bare relative path, and dash resolves that through `PATH` rather than the working directory, so on a machine where npm's script shell is not bash the whole suite aborted at once with `.: .env.test: not found`.
 - **Tests: isolate configuration writes** — configuration tests clear and restore an inherited `PI_CODING_AGENT_DIR` so temporary-home tests cannot overwrite the caller's config.
 
 - **Fix: git-status changes no longer bust the prompt cache (issue #73)** — the `claude_code` preset embeds a git-status snapshot in the cached system block, so any git transition (new file, staging, commit) rewrote the whole conversation prefix at cache-write rates. The provider path now sets `includeGitInstructions: false`, stripping the block with no other cost.
