@@ -598,9 +598,16 @@ async function runIsolatedSummary(
 const RECAP_FORK_KEY = Symbol.for("pi.recap-fork.v1");
 
 interface RecapForkTemplate {
+	/** The turn's options minus `mcpServers`, whose servers close over a
+	 *  QueryContext that must not outlive the turn. The fork rebuilds them. */
 	options: NonNullable<Parameters<typeof query>[0]["options"]>;
-	tools: Tool[];
+	/** Definitions only. Anything a pi Tool carries to execute with is dropped. */
+	tools: Array<{ name: string; description: string; parameters: unknown }>;
 	modelId: string;
+	/** The session this turn was written into. Paired with the options because
+	 *  they are only valid together: reading the live session later can pick up
+	 *  a rotation, or a session that predates the turn being recapped. */
+	sessionId: string;
 }
 
 export interface RecapForkRequest {
@@ -617,15 +624,26 @@ export interface RecapForkResult {
 
 let recapForkTemplate: RecapForkTemplate | null = null;
 
-function recordRecapForkTemplate(template: RecapForkTemplate): void {
-	recapForkTemplate = template;
+function recordRecapForkTemplate(args: {
+	options: NonNullable<Parameters<typeof query>[0]["options"]>;
+	tools: Tool[];
+	modelId: string;
+	sessionId: string;
+}): void {
+	const { mcpServers: _live, ...options } = args.options;
+	recapForkTemplate = {
+		options,
+		tools: args.tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters })),
+		modelId: args.modelId,
+		sessionId: args.sessionId,
+	};
 }
 
 /** Same tool definitions as the turn — the prefix depends on them — with handlers
  *  that refuse instead of executing. A recap turn must not run pi's tools, and
  *  waiting on queryCtx the way buildMcpServers does would hang until the caller's
  *  deadline rather than fail. */
-function refusingMcpServers(tools: Tool[]): Record<string, ReturnType<typeof createToolServer>> | undefined {
+function refusingMcpServers(tools: RecapForkTemplate["tools"]): Record<string, ReturnType<typeof createToolServer>> | undefined {
 	if (!tools.length) return undefined;
 	const defs = tools.map((tool) => ({
 		name: tool.name,
@@ -649,6 +667,14 @@ function recapForkOptions(
 	return {
 		...template.options,
 		mcpServers: refusingMcpServers(template.tools),
+		// Forced regardless of what the turn used. Without it Claude Code loads
+		// MCP servers from ~/.claude.json and .mcp.json, and those handlers are
+		// real: a recap turn that called one would run it for effect, and could
+		// hang on it past maxTurns, which bounds assistant turns and not tool
+		// time. A setup that disabled strict mode pays a cache miss here and
+		// keeps its tools unrun, which is the right way round.
+		strictMcpConfig: true,
+		extraArgs: { ...template.options.extraArgs, "strict-mcp-config": null },
 		resume: sessionId,
 		forkSession: true,
 		// No session file is written, so a recap leaves nothing behind to clean up
@@ -670,6 +696,12 @@ async function askForkedSession(request: RecapForkRequest): Promise<RecapForkRes
 	if (session.needsRebuild || session.forceRotate) {
 		throw new Error("Bridge session is mid-rebuild; run a normal turn first");
 	}
+	// The template names the session its turn was written into. If the live
+	// session has moved on, those options and that session id are no longer a
+	// matching pair and the fork would resume the wrong context.
+	if (session.sessionId !== template.sessionId) {
+		throw new Error("Bridge session rotated since the last turn; run a normal turn first");
+	}
 	request.signal?.throwIfAborted();
 
 	let sdkQuery: ReturnType<typeof query> | undefined;
@@ -681,10 +713,10 @@ async function askForkedSession(request: RecapForkRequest): Promise<RecapForkRes
 	};
 
 	try {
-		debug(`recap fork: resume=${session.sessionId.slice(0, 8)} model=${template.modelId}`);
+		debug(`recap fork: resume=${template.sessionId.slice(0, 8)} model=${template.modelId}`);
 		sdkQuery = query({
 			prompt: request.prompt,
-			options: { ...recapForkOptions(template, session.sessionId), ...makeCliDebugOptions("recap-fork") },
+			options: { ...recapForkOptions(template, template.sessionId), ...makeCliDebugOptions("recap-fork") },
 		});
 
 		if (request.signal) {
@@ -944,6 +976,8 @@ export const __test = {
 	streamClaudeAgentSdk,
 	recapForkOptions,
 	refusingMcpServers,
+	recordRecapForkTemplate,
+	peekRecapForkTemplate: () => recapForkTemplate,
 };
 
 // --- Provider helpers: tool name mapping ---
@@ -1882,10 +1916,6 @@ function streamClaudeAgentSdk(model: Model<any>, input: ProviderInput, options?:
 		...makeCliDebugOptions("provider"),
 	};
 
-	// Recorded before the query runs: these are the exact options whose prefix
-	// Claude Code will cache, which is what a later recap fork has to reproduce.
-	recordRecapForkTemplate({ options: queryOptions, tools: mcpTools, modelId: model.id });
-
 	debug("provider: fresh query",
 		`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
 		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"}`,
@@ -1958,6 +1988,14 @@ function streamClaudeAgentSdk(model: Model<any>, input: ProviderInput, options?:
 				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
 				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
 				sharedSession = { sessionId, cursor, cwd };
+				// Recorded here, not before the query: the options and the
+				// session they wrote into are only usable as a pair, and this
+				// is the first point both are known. A reentrant subagent query
+				// would otherwise leave its own prompt and tools as the
+				// template for a parent session it never wrote to.
+				if (!isReentrant) {
+					recordRecapForkTemplate({ options: queryOptions, tools: mcpTools, modelId: model.id, sessionId });
+				}
 			}
 
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
