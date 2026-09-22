@@ -579,6 +579,157 @@ async function runIsolatedSummary(
 	}
 }
 
+// --- Session recap fork ---
+//
+// A recap is the session's own model, in the session's own context, asked one
+// more question. That is also what makes it affordable: Claude Code caches the
+// request prefix, so a fork reproducing the turn's options reads that cache,
+// while any divergence — model string, system prompt append, settings, tool
+// definitions — writes a fresh prefix at full price. The template is the turn's
+// own options object rather than a reconstruction, because a reconstruction
+// drifts silently and the only symptom is a bigger bill.
+//
+// `persistSession: false` alongside `resume`/`forkSession` is what keeps the
+// fork ephemeral: no file under ~/.claude/projects, nothing to clean up, and
+// the resumed session is read and never written.
+// Provider-neutral and provider-keyed: the contract belongs to whoever can fork
+// a session's context, not to this package, and more than one provider may be
+// registered at once.
+const RECAP_FORK_KEY = Symbol.for("pi.recap-fork.v1");
+
+interface RecapForkTemplate {
+	options: NonNullable<Parameters<typeof query>[0]["options"]>;
+	tools: Tool[];
+	modelId: string;
+}
+
+export interface RecapForkRequest {
+	prompt: string;
+	signal?: AbortSignal;
+	/** pi model id the caller believes is active; a mismatch refuses the fork. */
+	modelId?: string;
+}
+
+export interface RecapForkResult {
+	text: string;
+	usage: { input: number; output: number; cacheRead: number; cacheWrite: number };
+}
+
+let recapForkTemplate: RecapForkTemplate | null = null;
+
+function recordRecapForkTemplate(template: RecapForkTemplate): void {
+	recapForkTemplate = template;
+}
+
+/** Same tool definitions as the turn — the prefix depends on them — with handlers
+ *  that refuse instead of executing. A recap turn must not run pi's tools, and
+ *  waiting on queryCtx the way buildMcpServers does would hang until the caller's
+ *  deadline rather than fail. */
+function refusingMcpServers(tools: Tool[]): Record<string, ReturnType<typeof createToolServer>> | undefined {
+	if (!tools.length) return undefined;
+	const defs = tools.map((tool) => ({
+		name: tool.name,
+		description: tool.description,
+		inputSchema: tool.parameters,
+		handler: async (): Promise<McpResult> => ({
+			content: [{ type: "text" as const, text: "Unavailable: recap turns are read-only." }],
+			isError: true,
+		}),
+	}));
+	return { [MCP_SERVER_NAME]: createToolServer(MCP_SERVER_NAME, defs) };
+}
+
+/** The turn's own options with only the fork differences applied. Everything not
+ *  named here is inherited verbatim, because each inherited field is part of the
+ *  prefix Claude Code cached and a divergence costs a full re-read. */
+function recapForkOptions(
+	template: RecapForkTemplate,
+	sessionId: string,
+): NonNullable<Parameters<typeof query>[0]["options"]> {
+	return {
+		...template.options,
+		mcpServers: refusingMcpServers(template.tools),
+		resume: sessionId,
+		forkSession: true,
+		// No session file is written, so a recap leaves nothing behind to clean up
+		// and the resumed session is read but never modified.
+		persistSession: false,
+		maxTurns: 1,
+		includePartialMessages: false,
+	};
+}
+
+async function askForkedSession(request: RecapForkRequest): Promise<RecapForkResult> {
+	const template = recapForkTemplate;
+	if (!template) throw new Error("No completed bridge turn to fork");
+	if (request.modelId && request.modelId !== template.modelId) {
+		throw new Error("Model changed since the last bridge turn");
+	}
+	const session = sharedSession;
+	if (!session) throw new Error("No bridge session to fork");
+	if (session.needsRebuild || session.forceRotate) {
+		throw new Error("Bridge session is mid-rebuild; run a normal turn first");
+	}
+	request.signal?.throwIfAborted();
+
+	let sdkQuery: ReturnType<typeof query> | undefined;
+	let wasAborted = false;
+	const onAbort = () => {
+		wasAborted = true;
+		void sdkQuery?.interrupt().catch(() => {});
+		try { sdkQuery?.close(); } catch {}
+	};
+
+	try {
+		debug(`recap fork: resume=${session.sessionId.slice(0, 8)} model=${template.modelId}`);
+		sdkQuery = query({
+			prompt: request.prompt,
+			options: { ...recapForkOptions(template, session.sessionId), ...makeCliDebugOptions("recap-fork") },
+		});
+
+		if (request.signal) {
+			if (request.signal.aborted) onAbort();
+			else request.signal.addEventListener("abort", onAbort, { once: true });
+		}
+
+		let assistantText = "";
+		let finalText = "";
+		let errorText: string | undefined;
+		const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+		let sawToolCall = false;
+
+		for await (const message of sdkQuery) {
+			if (wasAborted) break;
+			if (message.type === "assistant") {
+				for (const block of (message as any).message?.content ?? []) {
+					if (block.type === "text" && typeof block.text === "string") assistantText += block.text;
+					else if (block.type === "tool_use") sawToolCall = true;
+				}
+			} else if (message.type === "result") {
+				errorText = resultErrorText(message);
+				const raw = (message as any).usage ?? {};
+				usage.input = raw.input_tokens ?? 0;
+				usage.output = raw.output_tokens ?? 0;
+				usage.cacheRead = raw.cache_read_input_tokens ?? 0;
+				usage.cacheWrite = raw.cache_creation_input_tokens ?? 0;
+				if (!errorText && message.subtype === "success") finalText = message.result || assistantText;
+			}
+		}
+
+		if (wasAborted) throw new Error("Recap cancelled");
+		// A tool call means the answer is not the plain text the caller asked for.
+		if (sawToolCall) throw new Error("Recap turn attempted a tool call");
+		const text = (finalText || assistantText).trim();
+		if (errorText) throw new Error(errorText);
+		if (!text) throw new Error("Recap returned empty text");
+		debug(`recap fork: done textLen=${text.length} cacheRead=${usage.cacheRead} cacheWrite=${usage.cacheWrite}`);
+		return { text, usage };
+	} finally {
+		request.signal?.removeEventListener("abort", onAbort);
+		try { sdkQuery?.close(); } catch {}
+	}
+}
+
 function reinjectPriorCompactionFileOps(branchEntries: Array<{ type: string; details?: unknown }>, preparation: { fileOps: { read: Set<string>; edited: Set<string> } }): void {
 	const prior = [...branchEntries]
 		.reverse()
@@ -791,6 +942,8 @@ export const __test = {
 	buildMcpServers,
 	branchSummaryOutcome,
 	streamClaudeAgentSdk,
+	recapForkOptions,
+	refusingMcpServers,
 };
 
 // --- Provider helpers: tool name mapping ---
@@ -1729,6 +1882,10 @@ function streamClaudeAgentSdk(model: Model<any>, input: ProviderInput, options?:
 		...makeCliDebugOptions("provider"),
 	};
 
+	// Recorded before the query runs: these are the exact options whose prefix
+	// Claude Code will cache, which is what a later recap fork has to reproduce.
+	recordRecapForkTemplate({ options: queryOptions, tools: mcpTools, modelId: model.id });
+
 	debug("provider: fresh query",
 		`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
 		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"}`,
@@ -2215,6 +2372,11 @@ export default function (pi: ExtensionAPI) {
 			// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
 			streamSimple: streamClaudeAgentSdk as any,
 		});
+		// Published for extensions that need the session's own model to answer a
+		// question about the session — session-recap is the first. Symbol.for keeps
+		// it addressable across separately pinned packages, which cannot import each
+		// other: the bridge ships TypeScript with no package entry point.
+		g[RECAP_FORK_KEY] = { ...(g[RECAP_FORK_KEY] ?? {}), [PROVIDER_ID]: { ask: askForkedSession } };
 	} else {
 		// Subsequent instance (subagent session): skip registration entirely.
 		// The subagent already has access to claude-bridge models via the shared
