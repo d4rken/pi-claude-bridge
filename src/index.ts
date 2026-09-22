@@ -453,6 +453,36 @@ function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?
 	return `Claude rate limit${kind}${resets}: ${failure}`;
 }
 
+/** Spawn options for the summary subprocess: no tools, no skills, no session file and none
+ *  of Claude Code's own context, since pi hands it everything the summary is made of. */
+function isolatedSummaryOptions(args: {
+	cwd: string;
+	systemPrompt: Context["systemPrompt"];
+	cliModel: string;
+	claudeExecutable?: string;
+}) {
+	return {
+		cwd: args.cwd,
+		env: { ...process.env, ...CC_CHILD_ENV },
+		settings: { autoMemoryEnabled: false, claudeMdExcludes: CLAUDE_MD_EXCLUDES },
+		tools: [],
+		strictMcpConfig: true,
+		// A summary is a full API call and needs the same credentials as any other. Those live in
+		// settings.json — `apiKeyHelper`, `env` (ANTHROPIC_BASE_URL, Bedrock/Vertex), `awsAuthRefresh`
+		// — so a child with no setting sources authenticates as whatever ~/.claude/.credentials.json
+		// happens to hold: on a gateway or cloud-provider setup a stale subscription token, whose 401
+		// fails the compaction while ordinary turns keep working. Loading settings also loads
+		// CLAUDE.md, which is why it is excluded above.
+		settingSources: ["user", "project"] as SettingSource[],
+		skills: [],
+		persistSession: false,
+		systemPrompt: args.systemPrompt,
+		model: args.cliModel,
+		maxTurns: 1,
+		...(args.claudeExecutable ? { pathToClaudeCodeExecutable: args.claudeExecutable } : {}),
+	};
+}
+
 function isolatedStreamFn(model: Model<any>, input: ProviderInput, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = newAssistantMessageEventStream();
 	void runIsolatedSummary(model, input, options, stream);
@@ -485,18 +515,7 @@ async function runIsolatedSummary(
 		sdkQuery = query({
 			prompt: promptText,
 			options: {
-				cwd,
-				env: { ...process.env, ...CC_CHILD_ENV },
-				settings: { autoMemoryEnabled: false },
-				tools: [],
-				strictMcpConfig: true,
-				settingSources: [] as SettingSource[],
-				skills: [],
-				persistSession: false,
-				systemPrompt: context.systemPrompt,
-				model: cliModel,
-				maxTurns: 1,
-				...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
+				...isolatedSummaryOptions({ cwd, systemPrompt: context.systemPrompt, cliModel, claudeExecutable }),
 				...makeCliDebugOptions("compact-summary"),
 			},
 		});
@@ -761,6 +780,7 @@ export const __test = {
 	syncSharedSession,
 	setTranscriptHelpers,
 	isolatedStreamFn,
+	isolatedSummaryOptions,
 	extractUserPromptBlocks,
 	consumeQuery,
 	finalizeCurrentStream,
