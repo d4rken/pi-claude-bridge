@@ -161,8 +161,8 @@ describe("applyLongContext", () => {
 describe("resolveModel", () => {
 	const models = buildModels(MODEL_IDS_IN_ORDER.map(mockPiAiModel));
 
-	it("opus shortcut resolves to claude-opus-5 (first opus in order)", () => {
-		assert.equal(resolveModel(models, "opus")?.id, "claude-opus-5");
+	it("opus shortcut resolves to claude-opus-5-5 (first opus in order)", () => {
+		assert.equal(resolveModel(models, "opus")?.id, "claude-opus-5-5");
 	});
 
 	it("haiku shortcut resolves to claude-haiku-4-5", () => {
@@ -173,6 +173,11 @@ describe("resolveModel", () => {
 		assert.equal(resolveModel(models, "claude-opus-4-6")?.id, "claude-opus-4-6");
 	});
 
+	it("full ID beats an earlier id that contains it", () => {
+		assert.equal(resolveModel(models, "claude-opus-5")?.id, "claude-opus-5");
+		assert.equal(resolveModel(models, "claude-fable-5")?.id, "claude-fable-5");
+	});
+
 	it("returns undefined when no match", () => {
 		assert.equal(resolveModel(models, "gpt-9"), undefined);
 	});
@@ -180,8 +185,8 @@ describe("resolveModel", () => {
 	it("returns the matched model object for CLI-arg conversion", () => {
 		const oneMModels = buildModels(MODEL_IDS_IN_ORDER.map(oneM));
 		const model = resolveModel(oneMModels, "opus");
-		assert.equal(model.id, "claude-opus-5");
-		assert.equal(claudeCodeModelId(model, PRO), "claude-opus-5[1m]");
+		assert.equal(model.id, "claude-opus-5-5");
+		assert.equal(claudeCodeModelId(model, PRO), "claude-opus-5-5[1m]");
 	});
 });
 
@@ -214,5 +219,18 @@ describe("models absent from pi-ai's snapshot", () => {
 		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-fable-5-1", PRO), {
 			cliModelId: "claude-fable-5-1[1m]", contextWindow: 1000000,
 		});
+	});
+
+	it("derives Opus 5.5 from Opus 5 and registers it at 1M", () => {
+		const opus5 = { ...oneM("claude-opus-5"), maxTokens: 128000, thinkingLevelMap: { off: null, xhigh: "xhigh", max: "max" } };
+		const derived = find(buildModels([opus5]), "claude-opus-5-5");
+		assert.equal(derived?.name, "Claude Opus 5.5");
+		assert.equal(derived.contextWindow, 1000000);
+		assert.equal(derived.maxTokens, 128000);
+		assert.deepEqual(derived.thinkingLevelMap, { off: null, xhigh: "xhigh", max: "max" });
+		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-opus-5-5", PRO), {
+			cliModelId: "claude-opus-5-5[1m]", contextWindow: 1000000,
+		});
+		assert.equal(find(applyLongContext([derived], PRO), "claude-opus-5-5").name, "Claude Opus 5.5 1M");
 	});
 });

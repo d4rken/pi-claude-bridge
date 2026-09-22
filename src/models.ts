@@ -1,5 +1,5 @@
 // Canonical selection + display order for the model picker.
-// `resolveModel` returns the first partial match, so `opus` resolves to the first-listed opus entry.
+// `resolveModel` prefers an exact id, then the first partial match, so `opus` resolves to the first-listed opus entry.
 // Extracted from index.ts so tests can import without activating the extension.
 
 // pi-ai's bundled catalog is a release-time snapshot, so a model Anthropic
@@ -9,6 +9,7 @@
 // and override only identity. Drop the entry when the base is missing too.
 export const DERIVED_FROM: Record<string, { from: string; name: string }> = {
 	"claude-fable-5-1": { from: "claude-fable-5", name: "Claude Fable 5.1" },
+	"claude-opus-5-5": { from: "claude-opus-5", name: "Claude Opus 5.5" },
 };
 
 function deriveMissing<T extends { id: string; [key: string]: any }>(piAiModels: T[], id: string): T | undefined {
@@ -18,7 +19,7 @@ function deriveMissing<T extends { id: string; [key: string]: any }>(piAiModels:
 	return base ? { ...base, id, name: rule.name } : undefined;
 }
 
-export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
+export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
 
 // Project pi-ai's model entries down to the fields pi's registerProvider expects,
 // and keep MODEL_IDS_IN_ORDER ordering. IDs missing from pi-ai are silently dropped.
@@ -56,6 +57,8 @@ const ONE_M_CONTEXT = 1_000_000;
 // not, and [1m] entitlement differs by model. See diag/CONTEXT-SIZE.md.
 export function resolveClaudeCodeRuntimeModel(modelId: string, settings: LongContextSettings): ClaudeCodeRuntimeModel {
 	switch (modelId) {
+		case "claude-opus-5-5":
+			return { cliModelId: "claude-opus-5-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-opus-5":
 			return { cliModelId: "claude-opus-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-opus-4-8":
@@ -94,7 +97,7 @@ export function claudeCodeModelId(model: { id: string }, settings: LongContextSe
 
 export function resolveModel<T extends { id: string }>(models: T[], input: string): T | undefined {
 	const lower = input.toLowerCase();
-	return models.find((m) => m.id === lower || m.id.includes(lower));
+	return models.find((m) => m.id === lower) ?? models.find((m) => m.id.includes(lower));
 }
 
 // Produce the model metadata registered with pi. The registered contextWindow must
