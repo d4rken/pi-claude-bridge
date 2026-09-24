@@ -452,7 +452,7 @@ function isolatedSummaryOptions(args: {
 		// happens to hold: on a gateway or cloud-provider setup a stale subscription token, whose 401
 		// fails the compaction while ordinary turns keep working. Loading settings also loads
 		// CLAUDE.md, which is why it is excluded above.
-		settingSources: ["user", "project"] as SettingSource[],
+		settingSources: ["user", "project", "local"] as SettingSource[],
 		skills: [],
 		persistSession: false,
 		systemPrompt: args.systemPrompt,
@@ -590,6 +590,9 @@ async function runIsolatedSummary(
 // a session's context, not to this package, and more than one provider may be
 // registered at once.
 const RECAP_FORK_KEY = Symbol.for("pi.recap-fork.v1");
+/** How many later bridge instances serve a child session's own registry. */
+const RECAP_FORK_BLOCKERS_KEY = Symbol.for("pi-claude-bridge.recap-fork-blockers");
+let ownsChildProvider = false;
 
 interface RecapForkTemplate {
 	/** The turn's options minus `mcpServers`, whose servers close over a
@@ -680,6 +683,9 @@ function recapForkOptions(
 }
 
 async function askForkedSession(request: RecapForkRequest): Promise<RecapForkResult> {
+	if (((globalThis as Record<symbol, any>)[RECAP_FORK_BLOCKERS_KEY] ?? 0) > 0) {
+		throw new Error("A child session runs its own bridge provider; recap cannot tell which session is asking");
+	}
 	const template = recapForkTemplate;
 	if (!template) throw new Error("No completed bridge turn to fork");
 	if (request.modelId && request.modelId !== template.modelId) {
@@ -2011,9 +2017,11 @@ function streamClaudeAgentSdk(model: Model<any>, input: Context, options?: Simpl
 	};
 	const onAbort = () => {
 		wasAborted = true;
-		abortedSessionId ??= sharedSession?.sessionId;
+		// Only the session this query resumed is being written; a clean start or a preserved
+		// reentrant query writes its own file and leaves the shared session's cache intact.
+		abortedSessionId ??= resumeSessionId ?? undefined;
 		// The next turn must not reuse a file the dying child can still write.
-		if (sharedSession && sharedSession.sessionId === abortedSessionId) {
+		if (abortedSessionId && sharedSession?.sessionId === abortedSessionId) {
 			sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
 		}
 		drainForAbort(abortCtx, promptStream);
@@ -2031,10 +2039,11 @@ function streamClaudeAgentSdk(model: Model<any>, input: Context, options?: Simpl
 
 			// --- Abort detection in normal completion path ---
 			if (wasAborted || options?.signal?.aborted) {
-				if (sharedSession && sharedSession.sessionId === abortedSessionId) {
+				const marked = Boolean(abortedSessionId) && sharedSession?.sessionId === abortedSessionId;
+				if (marked && sharedSession) {
 					sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
 				}
-				debug(`provider: abort detected${sharedSession?.sessionId === abortedSessionId ? ", marked sharedSession needsRebuild + forceRotate" : ""}`);
+				debug(`provider: abort detected${marked ? ", marked sharedSession needsRebuild + forceRotate" : ""}`);
 				if (queryCtx.turnOutput) {
 					queryCtx.turnOutput.stopReason = "aborted";
 					queryCtx.turnOutput.errorMessage = "Operation aborted";
@@ -2078,7 +2087,7 @@ function streamClaudeAgentSdk(model: Model<any>, input: Context, options?: Simpl
 		.catch((error) => {
 			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
 			if (wasAborted || options?.signal?.aborted) {
-				if (sharedSession && sharedSession.sessionId === abortedSessionId) {
+				if (abortedSessionId && sharedSession?.sessionId === abortedSessionId) {
 					sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
 				}
 			} else {
@@ -2565,6 +2574,17 @@ export default function (pi: ExtensionAPI) {
 			}
 			debug(`provider: registry lacks ${PROVIDER_ID}, registering (module=${moduleInstanceId})`);
 			pi.registerProvider(PROVIDER_ID, providerConfig);
+			// The recap registry is process-wide and answers from the first instance's
+			// session, so it must not answer while this child serves its own.
+			if (!ownsChildProvider) {
+				ownsChildProvider = true;
+				g[RECAP_FORK_BLOCKERS_KEY] = (g[RECAP_FORK_BLOCKERS_KEY] ?? 0) + 1;
+			}
+		});
+		pi.on("session_shutdown", () => {
+			if (!ownsChildProvider) return;
+			ownsChildProvider = false;
+			g[RECAP_FORK_BLOCKERS_KEY] = Math.max(0, (g[RECAP_FORK_BLOCKERS_KEY] ?? 1) - 1);
 		});
 	}
 

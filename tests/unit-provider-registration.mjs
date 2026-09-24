@@ -50,6 +50,19 @@ describe("provider registration across module instances", () => {
 		assert.equal(registered[0].name, PROVIDER_ID);
 	});
 
+	it("recap refuses while a later instance serves a child's own registry", async () => {
+		const ask = (request = {}) => globalThis[Symbol.for("pi.recap-fork.v1")][PROVIDER_ID].ask({ prompt: "Recap.", ...request });
+		// The published ask answers from the first instance's session, so while a child
+		// runs its own provider it cannot tell which session is asking.
+		const { default: activateFresh } = await import("../src/index.js?recap-child");
+		const { emit } = activateWithMockPi(activateFresh);
+		emit("session_start", {}, { modelRegistry: registryWith("other-provider") });
+		await assert.rejects(ask(), /child session runs its own bridge provider/);
+
+		emit("session_shutdown");
+		await assert.rejects(ask(), /No completed bridge turn to fork/, "the refusal ends with the child");
+	});
+
 	it("later instance registers at session_start when its registry lacks the provider (#91)", async () => {
 		// A fresh module instance: the activate-time registration is skipped, and
 		// the decision moves to session_start with the session's own registry.

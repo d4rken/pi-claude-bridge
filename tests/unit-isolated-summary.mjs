@@ -18,7 +18,7 @@ const options = () => __test.isolatedSummaryOptions({
 
 describe("isolated summary subprocess", () => {
 	it("loads the settings sources that carry apiKeyHelper and env", () => {
-		assert.deepEqual(options().settingSources, ["user", "project"]);
+		assert.deepEqual(options().settingSources, ["user", "project", "local"]);
 	});
 
 	it("excludes CLAUDE.md, which those same sources would otherwise pull in", () => {
