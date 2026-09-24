@@ -1,6 +1,6 @@
 {
   "name": "pi-claude-bridge",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": false,
   "description": "Pi extension that uses Claude Code (via Agent SDK) as a model provider and adds an AskClaude tool.",
   "keywords": [
@@ -39,9 +39,9 @@
     "change-case": "5.4.4"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.82.1",
-    "@earendil-works/pi-coding-agent": ">=0.82.1",
-    "@earendil-works/pi-tui": ">=0.82.1",
+    "@earendil-works/pi-ai": ">=0.86.1",
+    "@earendil-works/pi-coding-agent": ">=0.86.1",
+    "@earendil-works/pi-tui": ">=0.86.1",
     "typebox": "*"
   },
   "devDependencies": {

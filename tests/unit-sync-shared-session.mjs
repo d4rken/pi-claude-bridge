@@ -17,6 +17,61 @@ describe("syncSharedSession", () => {
 		__test.setPiUI(null);
 	});
 
+	// Fresh-session transcript: the system prompt arrives as a leading system message
+	// (issue #106). It is prompt state, not history — a fresh session must still take
+	// the clean-start path (empty priors) rather than rebuild a session file holding nothing
+	// but a system head, which made --resume fail with "No conversation found".
+	it("takes the clean-start path when a transcript system message precedes the first user message", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "sync-shared-session-"));
+		try {
+			const result = __test.syncSharedSession([
+				{ role: "system", content: "You are Claude Code.", timestamp: Date.now() },
+				{ role: "user", content: "Hello", timestamp: Date.now() },
+			], cwd);
+
+			assert.equal(result.sessionId, null, "a fresh session with only prompt state as priors is a clean start");
+			assert.equal(result.preserveSharedSession, undefined);
+			assert.equal(__test.getSharedSession(), null, "a clean start must not create a session state");
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	// Mid-conversation tool-loadout updates land in the transcript as system messages. They must not inflate the cursor or be imported as history, or the next turn's
+	// reuse check (priors >= cursor) fails and every turn rebuilds the session.
+	it("keeps cursor arithmetic consistent when system messages punctuate the history", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "sync-shared-session-"));
+		const sessionId = randomUUID();
+		try {
+			const seeded = createSession({ sessionId, projectPath: cwd });
+			seeded.importMessages([
+				{ role: "user", content: "Hi" },
+				{ role: "assistant", content: [{ type: "text", text: "Hello." }] },
+			]);
+			seeded.save();
+			__test.setSharedSession({ sessionId, cursor: 2, cwd });
+
+			const result = __test.syncSharedSession([
+				{ role: "user", content: "Hi", timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "Hello." }], timestamp: Date.now() },
+				{ role: "system", content: "", toolsAdded: [{ name: "grep", description: "", parameters: {} }], timestamp: Date.now() },
+				{ role: "user", content: "Next", timestamp: Date.now() },
+			], cwd);
+
+			assert.equal(result.sessionId, sessionId, "2 priors at cursor 2 must resume, not rebuild");
+			assert.equal(__test.getSharedSession()?.cursor, 2, "cursor counts non-system messages only");
+			const session = openSession({ sessionId, projectPath: cwd });
+			assert.deepEqual(
+				session.messages.map((m) => m.type),
+				["user", "assistant"],
+				"the resumed session file must hold the non-system history",
+			);
+		} finally {
+			deleteSession(sessionId, cwd);
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
 	// The branch this exercises is the guard that stops a reentrant subagent from
 	// resuming — and then overwriting — the parent's session: a subagent's context
 	// is shorter than the parent's cursor, so it starts fresh and the parent's

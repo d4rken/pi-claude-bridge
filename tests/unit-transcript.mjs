@@ -1,170 +1,24 @@
 #!/usr/bin/env node
 
 /**
- * Pi 0.86 hands providers a normalized transcript: the system prompt and the tool
- * declarations ride in `role: "system"` messages instead of `context.systemPrompt`
- * and `context.tools`. The bridge indexes `messages` positionally, so both shapes
- * are folded back into the field form before anything else runs.
- *
- * The replay helpers below are pi-ai 0.86.1's (packages/ai/src/utils/transcript.ts
- * and text.ts), copied so the 0.86 shape is exercised on a 0.85 development host.
- * When the installed pi-ai exports them itself, the last case checks that the
- * bridge reaches for those without the seam.
+ * Pi hands providers a transcript: the system prompt and the tool declarations
+ * ride in `role: "system"` messages instead of `context.systemPrompt` and
+ * `context.tools`. These cases drive that shape through the provider's own entry
+ * points; toBridgeContext's replay rules are pinned in
+ * unit-transcript-replay-order.mjs.
  */
 
-import { describe, it, test, after } from "node:test";
+import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import * as piAi from "@earendil-works/pi-ai";
 import activate, { __test } from "../src/index.js";
-import { readTranscript, setTranscriptHelpers } from "../src/transcript.js";
-
-function contentText(content) {
-	if (typeof content === "string") return content;
-	return content.filter((block) => block.type === "text").map((block) => block.text).join("");
-}
-
-function getCurrentTools(messages) {
-	const tools = new Map();
-	for (const message of messages) {
-		if (message.role !== "system") continue;
-		for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
-		for (const tool of message.toolsAdded ?? []) tools.set(tool.name, tool);
-	}
-	return [...tools.values()];
-}
-
-function getCurrentSystemPrompt(messages) {
-	const content = [];
-	const sections = new Map();
-	let seen = false;
-	for (const message of messages) {
-		if (message.role !== "system") continue;
-		seen = true;
-		const text = contentText(message.content);
-		if (text.length > 0) content.push(text);
-		for (const [name, value] of Object.entries(message.sections ?? {})) {
-			if (value === null) sections.delete(name);
-			else sections.set(name, value);
-		}
-	}
-	if (!seen && getCurrentTools(messages).length === 0) return "";
-	return [content.join("\n\n"), ...sections.values()].filter((part) => part.length > 0).join("\n\n");
-}
-
-function normalizeContext(context) {
-	const hasPrompt = context.systemPrompt !== undefined && context.systemPrompt.length > 0;
-	const hasTools = context.tools !== undefined && context.tools.length > 0;
-	if (!hasPrompt && !hasTools) return { messages: context.messages };
-	const initial = { role: "system", content: context.systemPrompt ?? "", ...(hasTools ? { toolsAdded: context.tools } : {}), timestamp: 0 };
-	return { messages: [initial, ...context.messages] };
-}
-
-const helpers = { normalizeContext, getCurrentSystemPrompt, getCurrentTools };
-const hostHasHelpers = ["normalizeContext", "getCurrentSystemPrompt", "getCurrentTools"].every((name) => typeof piAi[name] === "function");
 
 const read = { name: "read", description: "Read a file", parameters: { type: "object", properties: {} } };
-const bash = { name: "bash", description: "Run a command", parameters: { type: "object", properties: {} } };
-const edit = { name: "edit", description: "Edit a file", parameters: { type: "object", properties: {} } };
 
 const user = (text) => ({ role: "user", content: [{ type: "text", text }], timestamp: 1 });
 const assistant = (text) => ({ role: "assistant", content: [{ type: "text", text }], timestamp: 2 });
-
-describe("readTranscript", () => {
-	after(() => setTranscriptHelpers(null));
-
-	it("passes a 0.85 context through with the same message array", () => {
-		const messages = [user("hi")];
-		const context = { systemPrompt: "P", tools: [read], messages };
-
-		const result = readTranscript(context);
-
-		assert.equal(result.systemPrompt, "P");
-		assert.deepEqual(result.tools, [read]);
-		assert.equal(result.messages, messages, "no system messages means nothing to strip");
-	});
-
-	it("replays a 0.86 transcript into prompt, tools and system-free messages", () => {
-		setTranscriptHelpers(helpers);
-		const transcript = {
-			messages: [
-				{ role: "system", content: "Base.", sections: { rules: "Rule one." }, toolsAdded: [read, bash], timestamp: 0 },
-				user("first"),
-				assistant("done"),
-				{ role: "system", content: "", sections: { rules: "Rule two." }, toolsRemoved: [bash], toolsAdded: [edit], timestamp: 3 },
-				user("second"),
-			],
-		};
-
-		const result = readTranscript(transcript);
-
-		assert.equal(result.systemPrompt, "Base.\n\nRule two.");
-		assert.deepEqual(result.tools.map((tool) => tool.name), ["read", "edit"]);
-		assert.deepEqual(result.messages.map((message) => message.role), ["user", "assistant", "user"]);
-		assert.equal(result.messages[2], transcript.messages[4], "surviving messages keep their identity");
-	});
-
-	it("reads top-level fields together with system messages, as normalizeContext does", () => {
-		setTranscriptHelpers(helpers);
-
-		const result = readTranscript({
-			systemPrompt: "Base.",
-			tools: [read, bash],
-			messages: [{ role: "system", content: "", sections: { rules: "Rule." }, toolsRemoved: [bash], timestamp: 1 }, user("hi")],
-		});
-
-		assert.equal(result.systemPrompt, "Base.\n\nRule.");
-		assert.deepEqual(result.tools.map((tool) => tool.name), ["read"]);
-		assert.deepEqual(result.messages.map((message) => message.role), ["user"]);
-	});
-
-	it("drops a section that a later system message sets to null", () => {
-		setTranscriptHelpers(helpers);
-
-		const result = readTranscript({
-			messages: [
-				{ role: "system", content: "Base.", sections: { rules: "Rule.", skills: "Skill." }, timestamp: 0 },
-				user("first"),
-				{ role: "system", content: "", sections: { rules: null }, timestamp: 2 },
-				user("second"),
-			],
-		});
-
-		assert.equal(result.systemPrompt, "Base.\n\nSkill.");
-	});
-
-	it("reports no prompt when the system messages only declare tools", () => {
-		setTranscriptHelpers(helpers);
-
-		const result = readTranscript({ messages: [{ role: "system", content: "", toolsAdded: [read], timestamp: 0 }, user("hi")] });
-
-		assert.equal(result.systemPrompt, undefined);
-		assert.deepEqual(result.tools, [read]);
-	});
-
-	it("names the missing host helpers instead of silently dropping the prompt", { skip: hostHasHelpers }, () => {
-		setTranscriptHelpers(null);
-
-		assert.throws(
-			() => readTranscript({ messages: [{ role: "system", content: "P", timestamp: 0 }, user("hi")] }),
-			/normalizeContext\/getCurrentSystemPrompt\/getCurrentTools/,
-		);
-	});
-
-	it("uses the installed pi-ai helpers when the host exports them", { skip: !hostHasHelpers }, () => {
-		setTranscriptHelpers(null);
-
-		const result = readTranscript({
-			messages: [{ role: "system", content: "P", toolsAdded: [read], timestamp: 0 }, user("hi")],
-		});
-
-		assert.equal(result.systemPrompt, "P");
-		assert.deepEqual(result.tools.map((tool) => tool.name), ["read"]);
-		assert.deepEqual(result.messages.map((message) => message.role), ["user"]);
-	});
-});
 
 /** The refusal reaches a caller either as a synchronous throw or as the stream's failure. */
 async function refusalMessage(run) {
@@ -197,7 +51,6 @@ test("the provider resolves the 0.86 transcript's prompt and positions", {
 	const streams = [];
 	try {
 		process.chdir(root);
-		setTranscriptHelpers(helpers);
 		activate({ on: (name, handler) => handlers.set(name, handler), registerProvider: (_id, config) => { provider = config; } });
 		handlers.get("before_agent_start")({ systemPrompt: "Review files.", systemPromptOptions: { customPrompt: "Review files." } });
 		const model = { ...provider.models[0], provider: "claude-bridge", api: "claude-bridge", baseUrl: "claude-bridge" };
@@ -227,21 +80,27 @@ test("the provider resolves the 0.86 transcript's prompt and positions", {
 		assert.equal(summary.stopReason, "error", "/bin/false stands in for Claude Code");
 		assert.doesNotMatch(summary.errorMessage, /expected exactly 1 user message/);
 
-		// A host that cannot replay the transcript fails the turn on the stream, so a
+		// A transcript that cannot be folded fails the turn on the stream, so a
 		// detached low-level caller sees a failed turn rather than an uncaught throw.
-		if (!hostHasHelpers) {
-			setTranscriptHelpers(null);
-			const unsupported = provider.streamSimple(model, { messages: [head, user("Continue.")] }, { cwd: root, signal: new AbortController().signal });
-			const settled = await unsupported.result();
-			assert.equal(settled.stopReason, "error");
-			assert.match(settled.errorMessage, /normalizeContext\/getCurrentSystemPrompt\/getCurrentTools/);
-		}
+		const malformed = { role: "system", content: 42, timestamp: 0 };
+		let unfoldable;
+		assert.doesNotThrow(() => {
+			unfoldable = provider.streamSimple(model, { messages: [malformed, user("Continue.")] }, { cwd: root, signal: new AbortController().signal });
+		});
+		const settled = await unfoldable.result();
+		assert.equal(settled.stopReason, "error");
+
+		// The isolated summary folds inside its own failure handling too: the stream
+		// ends with the error instead of the detached promise rejecting.
+		const unfoldableSummary = await __test.isolatedStreamFn(model, {
+			messages: [malformed, user("Summarize this conversation.")],
+		}, { cwd: root, signal: new AbortController().signal }).result();
+		assert.equal(unfoldableSummary.stopReason, "error");
 	} finally {
 		process.chdir(savedCwd);
 		for (const stream of streams) await stream.result();
 		handlers.get("session_shutdown")?.();
 		__test.resetSharedSession();
-		setTranscriptHelpers(null);
 		for (const [key, value] of Object.entries(saved)) {
 			if (value === undefined) delete process.env[key]; else process.env[key] = value;
 		}

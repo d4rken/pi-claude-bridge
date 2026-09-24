@@ -1,66 +1,74 @@
-import * as piAi from "@earendil-works/pi-ai";
-import type { Context, Tool } from "@earendil-works/pi-ai";
+/**
+ * Translate pi's transcript-shaped provider input into the prompt/tools fields used by
+ * the bridge's downstream consumers.
+ *
+ * System messages carry the base prompt and tool set plus later section patches and tool
+ * deltas. pi-ai replays that state, but preserves section replay order. Prompt capture
+ * keys come from pi's canonical section builder, so a deleted and re-added section must
+ * be ranked back into canonical order before the bridge performs its exact-key lookup.
+ */
+import {
+	contentText,
+	getCurrentSystemMessage,
+	getCurrentTools,
+	type Context,
+	type SystemMessage,
+} from "@earendil-works/pi-ai";
 
-// Pi 0.86 hands providers a normalized transcript: the system prompt and the tool
-// declarations travel as `role: "system"` messages (a leading one, then patches),
-// and `context.systemPrompt` / `context.tools` are gone. Pi 0.85 still passes them
-// as fields. The bridge indexes `messages` positionally in many places, so both
-// shapes are folded back into the field form here and nothing downstream sees a
-// system message.
+/** pi's canonical built-in section order; custom sections follow their replay position.
+ *  Known limitation, inherited from the pre-swap replay: if pi reorders existing custom
+ *  sections while patching an unrelated one, the replay diverges from getSystemPrompt()
+ *  and the exact-key capture lookup throws on that legitimate turn. Untriggered today:
+ *  pi builds custom sections in one patch per render. */
+const SECTION_RANK = new Map<string, number>([
+	["preamble", 0], ["tools", 1], ["rules", 2], ["docs", 3], ["addendum", 4],
+	["project_context", 5], ["skills", 6], ["cwd", 7],
+]);
 
-/** The pi-ai 0.86 replay helpers the bridge needs. Absent on 0.85. */
-export type TranscriptHelpers = {
-	normalizeContext(context: ProviderInput): { messages: Context["messages"] };
-	getCurrentSystemPrompt(messages: readonly { role: string }[]): string;
-	getCurrentTools(messages: readonly { role: string }[]): Tool[];
-};
-
-/** A provider input from either host generation. */
-export type ProviderInput = {
-	messages: Context["messages"];
-	systemPrompt?: string;
-	tools?: Tool[];
-};
-
-let helpers: Partial<TranscriptHelpers> = piAi as unknown as Partial<TranscriptHelpers>;
-
-/** Test seam: substitute the replay helpers, or `null` to restore pi-ai's. */
-export function setTranscriptHelpers(next: Partial<TranscriptHelpers> | null): void {
-	helpers = next ?? (piAi as unknown as Partial<TranscriptHelpers>);
+/**
+ * The map's entries, stably sorted by canonical rank. A name absent from the rank table
+ * inherits its replayed predecessor's rank, so an already-canonical replay remains
+ * unchanged and custom sections retain their position.
+ */
+function stableRanked(sections: Map<string, string>, ranks: Map<string, number>): Map<string, string> {
+	let predecessorRank = -1;
+	const ranked = [...sections].map(([name, value]) => {
+		const rank = ranks.get(name) ?? predecessorRank;
+		predecessorRank = rank;
+		return { name, value, rank };
+	});
+	ranked.sort((a, b) => a.rank - b.rank);
+	return new Map(ranked.map(({ name, value }) => [name, value]));
 }
 
-function isSystem(message: { role: string }): boolean {
-	return message.role === "system";
+/** Render replayed system state in the same section order as pi's prompt builder. */
+function canonicalSystemPrompt(message: SystemMessage | undefined): string | undefined {
+	if (!message) return undefined;
+	const sections = new Map<string, string>(
+		Object.entries(message.sections ?? {}).filter((entry): entry is [string, string] => entry[1] !== null),
+	);
+	const parts = [contentText(message.content), ...stableRanked(sections, SECTION_RANK).values()]
+		.filter((part) => part.length > 0);
+	return parts.length > 0 ? parts.join("\n\n") : undefined;
 }
 
 /**
- * Fold a provider input into the `{ systemPrompt, tools, messages }` shape, with
- * every system message removed from `messages`.
- *
- *   0.85: { systemPrompt: "P", tools: [t], messages: [user] }
- *   0.86: { messages: [{ role: "system", content: "P", toolsAdded: [t] }, user] }
- *   both: { systemPrompt: "P", tools: [t], messages: [user] }
- *
- * Top-level fields and system messages together are read the way pi-ai's own
- * `normalizeContext` reads them: the fields seed a leading system message and
- * the later ones still patch it.
+ * Restore the prompt and tools fields expected by the bridge and remove prompt-state
+ * messages from conversation history. Contexts without system messages are returned
+ * unchanged because systemless one-off calls already use the bridge-compatible shape.
  */
-export function readTranscript(input: ProviderInput): Context {
-	if (!input.messages.some(isSystem)) {
-		return { systemPrompt: input.systemPrompt, tools: input.tools, messages: input.messages };
-	}
-	const { normalizeContext, getCurrentSystemPrompt, getCurrentTools } = helpers;
-	if (typeof normalizeContext !== "function" || typeof getCurrentSystemPrompt !== "function" || typeof getCurrentTools !== "function") {
-		throw new Error(
-			"claude-bridge: the transcript carries system messages, but this pi-ai exports no "
-			+ "normalizeContext/getCurrentSystemPrompt/getCurrentTools to replay them (expected on Pi 0.86 or newer)",
-		);
-	}
-	const messages = normalizeContext(input).messages;
-	const systemPrompt = getCurrentSystemPrompt(messages);
+export function toBridgeContext(context: Context): Context {
+	if (!context.messages.some((message) => message.role === "system")) return context;
+	const tools = getCurrentTools(context.messages);
 	return {
-		systemPrompt: systemPrompt.length > 0 ? systemPrompt : undefined,
-		tools: getCurrentTools(messages),
-		messages: messages.filter((message) => !isSystem(message)),
+		...context,
+		systemPrompt: canonicalSystemPrompt(getCurrentSystemMessage(context.messages)),
+		tools: tools.length > 0 ? tools : undefined,
+		messages: nonSystemMessages(context.messages),
 	};
+}
+
+/** `messages` with every prompt-state system message removed from conversation history. */
+export function nonSystemMessages<T extends { role: string }>(messages: readonly T[]): T[] {
+	return messages.filter((message) => message.role !== "system");
 }

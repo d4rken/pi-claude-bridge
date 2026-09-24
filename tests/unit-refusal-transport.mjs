@@ -18,6 +18,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { __test } from "../src/index.js";
+import { PI_PREAMBLE } from "../src/prompt-capture.js";
 
 const { streamClaudeAgentSdk, getSharedSession, resetSharedSession } = __test;
 
@@ -66,6 +67,18 @@ describe("refusing an unaccountable system prompt", () => {
 		await terminalEvent(query("a prompt that must not disturb the session"));
 
 		assert.equal(getSharedSession(), null, "a refused turn must not claim or rotate a session");
+	});
+
+	it("refuses a recorded prompt carrying pi's harness the same way", async () => {
+		const leaking = `${PI_PREAMBLE}, a recorded prompt the harness guard rejects`;
+		__test.promptCaptures.record(leaking, { custom: leaking, contextFiles: [], skills: [] }, "before_agent_start");
+
+		let stream;
+		assert.doesNotThrow(() => { stream = query(leaking); });
+		const event = await terminalEvent(stream);
+
+		assert.equal(event?.type, "error");
+		assert.match(event.error.errorMessage, /refusing to send this prompt/);
 	});
 
 	it("attributes the failed turn to the model that was asked", async () => {

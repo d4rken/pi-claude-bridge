@@ -33,6 +33,9 @@ export interface Config {
 		// Anthropic billing). Enables Sonnet 4.6 [1m] on every plan and Opus 4.6
 		// [1m] on Pro.
 		longContextExtraUsage?: boolean;
+		// Model ids (e.g. "claude-future-9") whose declared 1M context Claude Code
+		// does not actually serve; pins them to the bare id at 200K.
+		forceTwoHundredK?: string[];
 	};
 }
 

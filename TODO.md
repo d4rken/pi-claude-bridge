@@ -27,12 +27,6 @@ that does not exist yet, or on someone else's repo.
    (`src/index.ts:1056`) turns a 1.1% invisible loss into a number, which is the
    prerequisite for ever explaining it.
 
-   Partly covered now: `convertPiMessages` returns a `dropped` summary and
-   `convertAndImportMessages` logs `dropped N thinking (<providers>)`, so the loss is
-   countable at conversion time. That is the aggregate, not the source — the
-   empty-signature case still needs the WARNING at `:1056` to tell "we minted
-   nothing" apart from "another provider minted it".
-
 3. **Delete `reasoningText`** (`src/index.ts:825`): `reasoning=` appears in 0 of
    14,994 `usage:` lines, so the SDK never supplies the field. Right now it reads
    as a working diagnostic. Delete it or record why it stays.
@@ -55,68 +49,6 @@ that does not exist yet, or on someone else's repo.
    QueryContext lifecycle × sync-path coverage map is in a gitignored directory, so
    nobody else gets it. Belongs in `docs/` or as a section of `diag/AUDIT.md`. (The
    provenance rule is already in `AGENTS.md`.)
-
-7. **Give every query its own `QueryContext`.** A top-level query reuses the
-   module-level singleton while a reentrant one gets a fresh context, so the same
-   teardown code serves two different lifetimes and `activeQuery` answers three
-   different questions: is a top-level query in flight (1389), which SDK query owns
-   this context (1571, 1628, 1648, 1672), and is this context the top-level one
-   (1416). Cleanup then has to reverse-engineer ownership from a field three
-   callbacks mutate — which is how the `.finally` guard came to test only
-   `=== sdkQuery`, a condition `.then`/`.catch` had already made unreachable on the
-   non-reentrant path, stranding the top-level context in `activeQueryContexts`
-   forever.
-
-   The change: `const queryCtx = new QueryContext()` unconditionally; drop
-   `!isReentrant &&` from the `.then`/`.catch` clears; drop the `.finally` guard
-   entirely, since nobody else can own the context. `isReentrant` survives only as
-   "may this query touch the shared session and cursor," which is what it means.
-   Replace the `resultCtx === ctx()` identity test at 1416 with an explicit
-   module-level `topLevelCtx` pointer set at query start and cleared in that query's
-   `.finally`, so "top-level" is a role rather than a property of which instance
-   happens to be the singleton.
-
-   Nothing depends on the singleton being long-lived: every field is already
-   re-initialized on the fresh-query path (1452–1460, plus `activeQuery` and
-   `promptStream`), so reuse loads no prior state and only saves an allocation.
-   Leave `resetTurnState`'s deliberate non-clearing of `turnToolCallIds`
-   (`query-state.ts:64`) alone — tool-result delivery calls it on the routed context
-   and needs those ids to survive. `ctx()`/`resetCtx()` are test handles, so test
-   setup needs adjusting.
-
-   Does not fix, and worth a comment either way: between `.then` finalizing the
-   stream and `.finally` removing the context, a finished query is still in the
-   routing set with stale `turnToolCallIds`, so a late orphaned result landing in
-   that microtask gap would take the delivery branch and return a stream nobody
-   ends.
-
-8. **A mid-turn steer shifts the attachment ordinal space, losing every later
-   `@file` carry.** The two sides count prompts differently. Claude Code records a
-   drained steer as a `queued_command` attachment whose parent is a tool_result
-   record, so `collectCarriedAttachments` gives it no ordinal (`userPromptText`
-   requires `type: "user"`). pi keeps it as an ordinary user message — the agent
-   loop pushes drained steering messages into `context.messages` verbatim — so
-   `placeCarriedAttachments` does count it. Every prompt after the first steer is
-   off by one, the text check drops the attachment, and only `debug()` says so.
-
-   Confirmed on disk: sessions `1020e4f3` and `108f73ea` show
-   `user(tool_result) → queue-operation → attachment(queued_command) → assistant`
-   with no companion user record. Attachments on prompts *before* the first steer
-   are unaffected. It stays dormant while the session is reused and only bites on
-   a rebuild — but aborts alone are 46% of rebuilds and unconditionally set
-   `needsRebuild`, so any session that uses `@file`, steers once and then aborts
-   loses the rest.
-
-   Fix direction: on the pi side, exclude a user message that follows a toolResult
-   with no intervening assistant — that is what a mid-turn steer looks like — from
-   the ordinal space. Beware the interaction: CC also writes its own
-   `[Request interrupted by user]` user record on abort, which shifts the *other*
-   way and can coincidentally cancel a steer's shift, so any fix needs to be
-   validated against an aborted session too, not just a steered one.
-
-   Test that would pin it: `@file` prompt A → mid-turn steer → `@file` prompt B →
-   force a rebuild → assert B's file survived. `int-tool-message.mjs` already
-   produces a verified `queued_command`.
 
 ## Blocked on a decision
 
@@ -151,10 +83,14 @@ No repro, so there is nothing to write yet. Re-run the scanners with
   one. **Also recompute the dose-response table**, which was built on the metric's
   false-positive mode.
 
-  The one cold boundary seen outside the proxy has not recurred; it differed from the
-  clean runs only in how turn 1 attached to the preceding stages' prefix (see
-  `diag/AUDIT.md`). If chased again, loop the whole `smoke → multi-turn → cache`
-  chain — looping `int-cache.sh` alone cannot reproduce that state.
+  One cold boundary was seen outside the proxy, in `int-cache.sh` running as stage 4
+  of `npm test`: turn 7 read 0 and wrote 13042 at a reuse boundary. It has not
+  recurred. The only structural difference from the 16 clean runs is how turn 1
+  attached — 8309 read / 3976 write (partial, sharing a prefix with the smoke and
+  multi-turn stages that preceded it) versus 12283 read / 0 write (full) in every
+  looped run, which shares a prefix only with itself. If this is chased again, loop
+  the whole `smoke → multi-turn → cache` chain; looping `int-cache.sh` alone cannot
+  produce the partial attach.
 
 - **4 stranded MCP handlers and 7 orphan queued results** (of 32 and 14; the rest
   are accounted for by abort/shutdown or the phantom-tool bug). Each of the 4 is a
@@ -220,60 +156,6 @@ No repro, so there is nothing to write yet. Re-run the scanners with
   via `tool_call` event, and surface plan approval through pi's TUI. Not
   applicable to AskClaude subagents. See `fractary/pi-claude-code`
   `PlanMode.ts`.
-
-## Testing strategy
-
-A review session found ten real bugs. The unit suite found roughly none of them and
-stayed green throughout; the throw in `resolveOrDerive` found two, `audit-warnings.mjs`
-caught the phantom-tool deadlock live, and a 135-message session on disk was the
-fixture for the eviction bug. That is the datum to design around.
-
-The reason is structural: in glue code the bug is a false belief about the
-counterparty, and a hand-written fixture encodes the same belief as the code. The
-queue tests paired by id *by construction* because we believed pairing was by id, and
-stayed green through the whole mispairing bug. So the question for any new test is
-where its inputs and its oracle come from that did not pass through our own head.
-Only three sources qualify: recorded real traffic, the live counterparty, and
-conservation laws ("nothing vanished") that hold without knowing the right answer.
-
-Ranked by leverage per effort:
-
-1. **Quiescence and leak assertions.** After a turn settles, `activeQueryContexts`
-   should be empty, no tool call pending, no prompt stream live. The
-   `activeQueryContexts` leak was present on *every* run of the happy path — it
-   needed no adversarial interleaving, just an assertion that anything ends clean.
-   Shipped as a debug-gated shutdown dump so real sessions report it too.
-2. **Corpus replay as a release gate.** `diag/replay-write-path.mjs` replays one
-   session on suspicion; point it at every session on disk and assert zero synthetic
-   stubs, zero skipped attachments, no capture throws. `placeCarriedAttachments`
-   already returns `skipped` — the accounting existed and the `@file` bug happened
-   anyway, because no hand-written fixture contained a mid-turn steer. Accounting
-   plus synthetic fixtures stays green; accounting plus the real corpus goes red.
-3. **Fixture provenance, and drive production objects.** Counterparty-shaped test
-   input must be recorded (`tests/fixtures/sdk-streams`, `tests/lib/record-sdk-streams.mjs`),
-   never hand-written; a test must drive the real object through its real entry point
-   rather than a model of it. Corollary: a regression test never observed failing
-   without its fix is not evidence.
-4. **`strictNullChecks`.** Exactly 27 errors today (13 `convert.ts`, 9 `index.ts`,
-   5 `session-verify.ts`). The tsconfig comment fears `!` noise, but each forced `!`
-   marks a nullable-at-type-level, non-null-by-invariant claim — the exact category of
-   unchecked belief that keeps biting. Hygiene, not strategy: it catches its own class
-   and nothing else.
-5. **Source-inventory tripwires over pi.** Claude Code is closed, so we probe it;
-   pi is installed in `node_modules`, so read it. A behavioural contract file can only
-   probe entry points we already know about, which is why nothing caught branch
-   summarization routing through the agent stream function. Assert instead that the
-   set of pi modules consuming `streamFn` still matches the handled list, so a new one
-   goes red at bump time.
-6. **Byte conservation on `projectPromptCapture`** — wrap a recorded prompt in
-   arbitrary text and assert every byte outside the substituted spans survives.
-
-Not worth doing: randomised sequence/invariant harnesses (their invariants come from
-the same head that wrote the bug — the eviction bug's wrong spec would have been
-asserted as the invariant, and the promise-ordering bug lives below the abstraction
-such a harness would model); boundary fuzzing (the failures are semantic
-disagreements between two structured systems, not parser crashes); mutation testing
-in CI; live shadow execution, which recorded-traffic replay subsumes at no API cost.
 
 ## Lower-priority testing gaps
 

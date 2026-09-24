@@ -1,33 +1,49 @@
-// Canonical selection + display order for the model picker.
-// `resolveModel` prefers an exact id, then the first partial match, so `opus` resolves to the first-listed opus entry.
-// Extracted from index.ts so tests can import without activating the extension.
+// Model selection + display-order policy for the model picker. The picker is
+// driven by pi-ai's anthropic catalog: models appear (and disappear) with it,
+// no per-model code here. Extracted from index.ts so tests can import without
+// activating the extension.
+// `resolveModel` resolves family shortcuts (opus/sonnet/fable) to the newest
+// matching id regardless of sort order; sort order only drives picker display.
 
-// pi-ai's bundled catalog is a release-time snapshot, so a model Anthropic
-// ships after it — Fable 5.1 on 28/08/2026 — is simply absent, and buildModels
-// drops what it cannot find. Rather than invent a context window that pi would
-// put behind its compaction threshold, inherit a verified sibling's metadata
-// and override only identity. Drop the entry when the base is missing too.
-export const DERIVED_FROM: Record<string, { from: string; name: string }> = {
-	"claude-fable-5-1": { from: "claude-fable-5", name: "Claude Fable 5.1" },
-	"claude-opus-5-5": { from: "claude-opus-5", name: "Claude Opus 5.5" },
-};
+const TWO_HUNDRED_K_CONTEXT = 200_000;
+const ONE_M_CONTEXT = 1_000_000;
 
-function deriveMissing<T extends { id: string; [key: string]: any }>(piAiModels: T[], id: string): T | undefined {
-	const rule = DERIVED_FROM[id];
-	if (!rule) return undefined;
-	const base = piAiModels.find((m) => m.id === rule.from);
-	return base ? { ...base, id, name: rule.name } : undefined;
+// pi-ai ships dated snapshot ids (claude-opus-4-5-20251101, ...) alongside the
+// bare ids. They are never exposed - and must not steal first-partial-match
+// shortcuts like "opus-4-5" from the bare id.
+function isDatedAlias(id: string): boolean {
+	return /-20\d{6}$/.test(id);
 }
 
-export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
+// Family tiers for display order: flagship families first; unknown families
+// sink below all known ones.
+const FAMILY_ORDER = ["fable", "opus", "sonnet", "haiku"];
 
 // Project pi-ai's model entries down to the fields pi's registerProvider expects,
-// and keep MODEL_IDS_IN_ORDER ordering. IDs missing from pi-ai are silently dropped.
-// Context-dependent display labels are applied after plan/long-context config is known.
+// newest generation first. Context-dependent display labels are applied after
+// plan/long-context config is known.
+// Version rank of a claude id, e.g. claude-opus-4-7 → ["opus", 4, 7]. Shared by
+// the display sort and resolveModel's newest-first partial tiebreak.
+function versionRank(id: string): { family: string; tuple: [number, number] } {
+	const [, family, major, minor] = id.split("-");
+	return { family, tuple: [Number(major) || 0, Number(minor) || 0] };
+}
+
 export function buildModels<T extends { id: string; [key: string]: any }>(piAiModels: T[]) {
-	return MODEL_IDS_IN_ORDER
-		.map((id) => piAiModels.find((m) => m.id === id) ?? deriveMissing(piAiModels, id))
-		.filter((m) => m != null)
+	return piAiModels
+		.filter((m) => typeof m.id === "string" && !isDatedAlias(m.id))
+		.sort((a, b) => {
+			const fa = FAMILY_ORDER.indexOf(versionRank(a.id).family);
+			const fb = FAMILY_ORDER.indexOf(versionRank(b.id).family);
+			const ta = fa === -1 ? FAMILY_ORDER.length : fa;
+			const tb = fb === -1 ? FAMILY_ORDER.length : fb;
+			if (ta !== tb) return ta - tb;
+			const ra = versionRank(a.id).tuple;
+			const rb = versionRank(b.id).tuple;
+			if (ra[0] !== rb[0]) return rb[0] - ra[0];
+			if (ra[1] !== rb[1]) return rb[1] - ra[1];
+			return a.id.localeCompare(b.id);
+		})
 		// Forward thinkingLevelMap so pi-ai's per-model overrides (e.g. opus-4-8
 		// mapping xhigh→xhigh and max→max) are visible to the effort lookup.
 		.map(({ id, name, reasoning, input, contextWindow, maxTokens, thinkingLevelMap }) => ({
@@ -42,6 +58,9 @@ export function buildModels<T extends { id: string; [key: string]: any }>(piAiMo
 export type LongContextSettings = {
 	plan: "pro" | "max";
 	longContextExtraUsage: boolean;
+	// Model ids whose declared 1M context Claude Code turned out not to serve;
+	// forces bare id at 200K without a code change.
+	forceTwoHundredK?: string[];
 };
 
 export type ClaudeCodeRuntimeModel = {
@@ -49,55 +68,79 @@ export type ClaudeCodeRuntimeModel = {
 	contextWindow: number;
 };
 
-const TWO_HUNDRED_K_CONTEXT = 200_000;
-const ONE_M_CONTEXT = 1_000_000;
+// Measured Claude Agent SDK behavior - see diag/CONTEXT-SIZE.md:
+// - The `[1m]` suffix is the only reliable way to request 1M context through
+//   the SDK; bare ids serve 200K.
+// - An unentitled `[1m]` id is rejected outright (400/429), failing every turn
+//   — worse than serving 200K, so the default is bare id at 200K and only
+//   measured-good ids get `[1m]`.
+// - The registered contextWindow must match the window the bridge actually
+//   requests, or pi's status bar and compaction threshold misreport.
+// [1m] ids verified to serve 1M on every plan. A new model serves 200K until
+// someone measures it (diag/context-size.mjs) and adds it here.
+const MEASURED_ONE_M = new Set([
+	"claude-fable-5",
+	"claude-fable-5-1",
+	"claude-opus-5-5",
+	"claude-opus-5",
+	"claude-opus-4-8",
+	"claude-opus-4-7",
+	"claude-sonnet-5",
+]);
 
-// Measured Claude Agent SDK subscription/OAuth behavior. Do not infer this from
-// pi-ai's advertised contextWindow: bare Opus 4.7 serves 1M, bare Opus 4.8 does
-// not, and [1m] entitlement differs by model. See diag/CONTEXT-SIZE.md.
-export function resolveClaudeCodeRuntimeModel(modelId: string, settings: LongContextSettings): ClaudeCodeRuntimeModel {
-	switch (modelId) {
-		case "claude-opus-5-5":
-			return { cliModelId: "claude-opus-5-5[1m]", contextWindow: ONE_M_CONTEXT };
-		case "claude-opus-5":
-			return { cliModelId: "claude-opus-5[1m]", contextWindow: ONE_M_CONTEXT };
-		case "claude-opus-4-8":
-			return { cliModelId: "claude-opus-4-8[1m]", contextWindow: ONE_M_CONTEXT };
-		case "claude-opus-4-7":
-			return { cliModelId: "claude-opus-4-7", contextWindow: ONE_M_CONTEXT };
-		case "claude-opus-4-6": {
-			const useOneM = settings.plan === "max" || settings.longContextExtraUsage;
-			return {
-				cliModelId: useOneM ? "claude-opus-4-6[1m]" : "claude-opus-4-6",
-				contextWindow: useOneM ? ONE_M_CONTEXT : TWO_HUNDRED_K_CONTEXT,
-			};
-		}
-		case "claude-fable-5-1":
-			return { cliModelId: "claude-fable-5-1[1m]", contextWindow: ONE_M_CONTEXT };
-		case "claude-fable-5":
-			return { cliModelId: "claude-fable-5[1m]", contextWindow: ONE_M_CONTEXT };
-		case "claude-sonnet-5":
-			return { cliModelId: "claude-sonnet-5[1m]", contextWindow: ONE_M_CONTEXT };
-		case "claude-sonnet-4-6":
-			return {
-				cliModelId: settings.longContextExtraUsage ? "claude-sonnet-4-6[1m]" : "claude-sonnet-4-6",
-				contextWindow: settings.longContextExtraUsage ? ONE_M_CONTEXT : TWO_HUNDRED_K_CONTEXT,
-			};
-		case "claude-haiku-4-5":
-			return { cliModelId: "claude-haiku-4-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
-		default:
-			console.error(`claude-bridge: encountered model ${modelId} with no known context size, defaulting to 200K`);
-			return { cliModelId: modelId, contextWindow: TWO_HUNDRED_K_CONTEXT };
+// Measured exceptions: pi-ai declares 1M and the [1m] id works, but only when
+// the plan allows it.
+const PLAN_GATED_ONE_M: Record<string, (settings: LongContextSettings) => boolean> = {
+	// [1m] measured 1M on Max plan / extra usage; 429 on Pro without it.
+	"claude-opus-4-6": (settings) => settings.plan === "max" || settings.longContextExtraUsage,
+	// [1m] measured 1M with extra usage only.
+	"claude-sonnet-4-6": (settings) => settings.longContextExtraUsage,
+};
+
+export function resolveClaudeCodeRuntimeModel(
+	model: { id: string },
+	settings: LongContextSettings,
+): ClaudeCodeRuntimeModel {
+	const modelId = model.id;
+	if (settings.forceTwoHundredK?.includes(modelId)) {
+		return { cliModelId: modelId, contextWindow: TWO_HUNDRED_K_CONTEXT };
 	}
+	if (MEASURED_ONE_M.has(modelId)) {
+		return { cliModelId: `${modelId}[1m]`, contextWindow: ONE_M_CONTEXT };
+	}
+	const planGate = PLAN_GATED_ONE_M[modelId];
+	if (planGate) {
+		const useOneM = planGate(settings);
+		return {
+			cliModelId: useOneM ? `${modelId}[1m]` : modelId,
+			contextWindow: useOneM ? ONE_M_CONTEXT : TWO_HUNDRED_K_CONTEXT,
+		};
+	}
+	// No measured row: bare id at 200K, the safe default (see diag/CONTEXT-SIZE.md).
+	return { cliModelId: modelId, contextWindow: TWO_HUNDRED_K_CONTEXT };
 }
 
 export function claudeCodeModelId(model: { id: string }, settings: LongContextSettings): string {
-	return resolveClaudeCodeRuntimeModel(model.id, settings).cliModelId;
+	return resolveClaudeCodeRuntimeModel(model, settings).cliModelId;
 }
 
 export function resolveModel<T extends { id: string }>(models: T[], input: string): T | undefined {
 	const lower = input.toLowerCase();
-	return models.find((m) => m.id === lower) ?? models.find((m) => m.id.includes(lower));
+	// Exact first, then partial (mirrors pi's tryMatchModel ordering), so a
+	// longer newer id containing the input (claude-fable-5-1 vs "claude-fable-5")
+	// cannot shadow the exact match.
+	return models.find((m) => m.id === lower)
+		?? newestPartialMatch(models.filter((m) => m.id.includes(lower)));
+}
+
+// Newest match by version rank — independent of registration order.
+function newestPartialMatch<T extends { id: string }>(candidates: T[]): T | undefined {
+	if (candidates.length === 0) return undefined;
+	return candidates.reduce((best, m) => {
+		const [vb, vbest] = [versionRank(m.id).tuple, versionRank(best.id).tuple];
+		const newer = vb[0] !== vbest[0] ? vb[0] > vbest[0] : vb[1] > vbest[1];
+		return newer ? m : best;
+	});
 }
 
 // Produce the model metadata registered with pi. The registered contextWindow must
@@ -109,7 +152,7 @@ export function applyLongContext<T extends { id: string; name: string; contextWi
 	settings: LongContextSettings,
 ): T[] {
 	return models.map((m) => {
-		const { contextWindow } = resolveClaudeCodeRuntimeModel(m.id, settings);
+		const { contextWindow } = resolveClaudeCodeRuntimeModel(m, settings);
 		const name = contextWindow > TWO_HUNDRED_K_CONTEXT && !/\b1M\b/i.test(m.name) ? `${m.name} 1M` : m.name;
 		return contextWindow === m.contextWindow && name === m.name ? m : { ...m, contextWindow, name };
 	});

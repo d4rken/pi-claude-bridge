@@ -1,10 +1,8 @@
-import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
-import * as piAi from "@earendil-works/pi-ai";
+import { calculateCost, createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
 import { buildSessionContext, compact, generateBranchSummary, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
-import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
 import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
@@ -18,23 +16,17 @@ import { extractAllToolResults as _extractAllToolResults, type McpResult } from 
 import { QueryContext, ctx } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
 import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
-import { readTranscript, setTranscriptHelpers, type ProviderInput } from "./transcript.js";
 import {
 	collectPromptSkills,
 	projectPromptCapture,
-	PromptCaptures,
+	sharedPromptCaptures,
 	type PromptCapture,
 } from "./prompt-capture.js";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
-
-// Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
-const _piAi = piAi as any;
-const newAssistantMessageEventStream: () => AssistantMessageEventStream =
-	typeof _piAi.createAssistantMessageEventStream === "function"
-		? _piAi.createAssistantMessageEventStream
-		: () => new _piAi.AssistantMessageEventStream();
+import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
+import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 
 // --- Debug logging ---
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to ~/.pi/agent/claude-bridge.log
@@ -136,20 +128,9 @@ function diagDump(label: string, data: Record<string, unknown>) {
 
 // --- Constants ---
 
-// Global key to prevent re-registration of the provider across module reloads.
-//
-// Extensions like pi-subagents spawn a subagent and it loads this module
-// again. Without this guard, the subagent's call to registerProvider() would
-// overwrite the parent's `streamSimple` function reference in the shared
-// ModelRegistry. When the parent later delivers a tool result, it would call
-// the subagent's `streamSimple` (which has empty state) instead of its own.
-//
-// By storing the active streamSimple in a Symbol.for() global (shared across all
-// module instances), we ensure only the FIRST instance to register takes effect.
-// Subsequent instances wrap the stored function instead of overwriting it.
-//
-// On session_shutdown (including /reload), clearSession() resets this so a fresh
-// registration can occur for the next session.
+// Marks which bridge module instance owns the registered provider's stream fn.
+// Full registration policy (first vs later instances, shared vs own registry):
+// see the "--- Provider ---" block in activate() below.
 const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
 
 // Claude Code's own builtin tools, for the AskClaude path where CC really runs
@@ -188,10 +169,8 @@ const ASKCLAUDE_ALWAYS_BLOCKED = [
 	"ToolSearch", // probes for blocked tools, wastes tokens
 	"ScheduleWakeup", // no harness to fire wakeup from inside a delegated subagent
 ];
-const MODE_DISALLOWED_TOOLS: Record<string, string[]> = {
-	full: [
-		...ASKCLAUDE_ALWAYS_BLOCKED,
-	],
+const MODE_DISALLOWED_TOOLS: Record<AskClaudeMode, string[]> = {
+	full: ASKCLAUDE_ALWAYS_BLOCKED,
 	read: [
 		...ASKCLAUDE_ALWAYS_BLOCKED,
 		"Write", "Edit", "Bash", "NotebookEdit",
@@ -439,7 +418,7 @@ function resultErrorText(message: SDKMessage): string | undefined {
  *
  *  pi has no typed rate-limit error — `stopReason` is only ever `"error"` and the sole carrier
  *  is `errorMessage` — so everything that reacts to a rate limit pattern-matches that string:
- *  pi-subagents gates `fallbackModels` on a 35-pattern list, and key-rotating extensions use
+ *  pi-subagents gates `fallbackModels` on its own pattern list, and key-rotating extensions use
  *  their own. Claude Code words a subscription limit as "You're out of extra usage · resets
  *  6:30pm", which matches none of them, so an exhausted quota reads as a fatal error and the
  *  fallback chain never runs (issue #58).
@@ -449,7 +428,7 @@ function resultErrorText(message: SDKMessage): string | undefined {
  *  failure and refuses to retry. */
 function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?: number }, failure: string): string {
 	const kind = rejection.rateLimitType ? ` (${rejection.rateLimitType})` : "";
-	const resets = rejection.resetsAt ? ` — resets ${new Date(rejection.resetsAt * 1000).toLocaleTimeString()}` : "";
+	const resets = rejection.resetsAt ? ` — resets ${new Date(rejection.resetsAt * 1000).toLocaleTimeString()}` : ""; // resetsAt: Unix seconds (unit undocumented in the SDK; observed)
 	return `Claude rate limit${kind}${resets}: ${failure}`;
 }
 
@@ -483,15 +462,15 @@ function isolatedSummaryOptions(args: {
 	};
 }
 
-function isolatedStreamFn(model: Model<any>, input: ProviderInput, options?: SimpleStreamOptions): AssistantMessageEventStream {
-	const stream = newAssistantMessageEventStream();
-	void runIsolatedSummary(model, input, options, stream);
+function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+	void runIsolatedSummary(model, context, options, stream);
 	return stream;
 }
 
 async function runIsolatedSummary(
 	model: Model<any>,
-	input: ProviderInput,
+	context: Context,
 	options: SimpleStreamOptions | undefined,
 	stream: AssistantMessageEventStream,
 ): Promise<void> {
@@ -504,9 +483,24 @@ async function runIsolatedSummary(
 	};
 
 	try {
-		const context = readTranscript(input);
-		const promptText = extractIsolatedSummaryPrompt(context.messages);
-		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+		// pi delivers compaction/branch-summary requests as a transcript: the summarization
+		// prompt folded into a leading system message ahead of the lone user message
+		// (issue #106). toBridgeContext restores the prompt/tools fields the extraction
+		// assertion below assumes; the summarization prompt still reaches CC as its systemPrompt.
+		// Inside the try so a transcript it cannot fold fails the stream instead of
+		// rejecting this detached promise.
+		context = toBridgeContext(context);
+		// One-off summarizer calls (compaction, branch summary, turn prefix, bug report —
+		// anything routed through pi's completeSummarization) are marked cacheRetention:
+		// "none". Any of them may appear in a future pi release without a bridge change,
+		// so route on the marker, not on which summarizer is calling. Non-summarizer calls
+		// must still match the [system,user] compaction shape exactly.
+		const isOneOffSummary = options?.cacheRetention === "none";
+		const promptText = isOneOffSummary
+			? extractUserPrompt(context.messages)
+			: extractIsolatedSummaryPrompt(context.messages);
+		if (!promptText) throw new Error("runIsolatedSummary: one-off summary without a user prompt (last message is not user?)");
+		const cwd = process.cwd();
 		const compactProviderSettings = loadConfig(cwd).provider;
 		const claudeExecutable = compactProviderSettings?.pathToClaudeCodeExecutable;
 		const cliModel = claudeCodeModelId(model, longContextSettings);
@@ -860,7 +854,11 @@ function syncSharedSession(
 	customToolNameToSdk?: Map<string, string>,
 	modelId?: string,
 ): SyncResult {
-	const priorMessages = messages.slice(0, turnStart(messages)); // everything before the current user turn
+	// System messages are pi's transcript representation of prompt and tool state, not
+	// conversation history — they are never imported into a CC session, so exclude them from
+	// the history space (priorMessages, cursor, missed) everywhere below (issue #106).
+	const history = nonSystemMessages(messages);
+	const priorMessages = history.slice(0, turnStart(history)); // everything before the current user turn
 
 	// REUSE path
 	//
@@ -904,7 +902,7 @@ function syncSharedSession(
 
 	// REBUILD path
 	if (priorMessages.length === 0) {
-		debug(`Case 1: clean start, ${messages.length} total messages`);
+		debug(`Case 1: clean start, ${history.length} total messages`);
 		debug(`syncResult: path=clean-start`);
 		return { sessionId: null };
 	}
@@ -960,8 +958,8 @@ export const __test = {
 	setPiUI(ui: ExtensionUIContext | null) {
 		piUI = ui;
 	},
+	toBridgeContext,
 	syncSharedSession,
-	setTranscriptHelpers,
 	isolatedStreamFn,
 	isolatedSummaryOptions,
 	extractUserPromptBlocks,
@@ -978,6 +976,9 @@ export const __test = {
 	refusingMcpServers,
 	recordRecapForkTemplate,
 	peekRecapForkTemplate: () => recapForkTemplate,
+	get promptCaptures() {
+		return promptCaptures;
+	},
 };
 
 // --- Provider helpers: tool name mapping ---
@@ -1063,8 +1064,10 @@ function showStartupNoticeOnce(): void {
 }
 
 // Captures of what pi assembled per agent; see src/prompt-capture.ts for why this
-// is keyed rather than held in a single slot.
-const promptCaptures = new PromptCaptures(256, (diagnostic) => {
+// is keyed rather than held in a single slot. One process-wide instance, shared
+// across every extension module instance: isolated subagents re-evaluate this
+// module, and the pinned stream they all route through resolves against it.
+const promptCaptures = sharedPromptCaptures((diagnostic) => {
 	const first = diagnostic.matches[0];
 	debug(
 		`prompt-capture: no match for ${diagnostic.systemPrompt.length}-char system prompt. `
@@ -1190,9 +1193,9 @@ function updateUsage(output: AssistantMessage, usage: Record<string, number | un
 	if (usage.output_tokens != null) output.usage.output = usage.output_tokens;
 	if (usage.cache_read_input_tokens != null) output.usage.cacheRead = usage.cache_read_input_tokens;
 	if (usage.cache_creation_input_tokens != null) output.usage.cacheWrite = usage.cache_creation_input_tokens;
-	// Claude Code may report reasoning/thinking tokens separately, while pi's Usage type does not model that field.
+	// Claude Code may report reasoning/thinking tokens separately from output tokens.
 	const reasoning = usage.reasoning_tokens ?? usage.thinking_tokens;
-	if (reasoning != null) (output.usage as typeof output.usage & { reasoning?: number }).reasoning = reasoning;
+	if (reasoning != null) output.usage.reasoning = reasoning;
 	output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 	calculateCost(model, output.usage);
 	const promptTokens = output.usage.input + output.usage.cacheRead + output.usage.cacheWrite;
@@ -1221,6 +1224,8 @@ function logServedContextWindow(label: string, message: SDKMessage, model: Model
 const REASONING_TO_EFFORT: Record<string, EffortLevel> = {
 	minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "max",
 };
+
+const VALID_EFFORTS = new Set<string>(["low", "medium", "high", "xhigh", "max"]);
 
 // --- Provider helpers: misc ---
 
@@ -1302,7 +1307,13 @@ function processStreamEvent(
 	const event = (message as SDKMessage & { event: any }).event;
 
 	if (event?.type === "message_start") {
+		// Still open from an earlier message_start: Claude Code gave up on that
+		// stream and is retrying it. Its blocks were never completed.
+		if (c.turnStreamOpen) dropAbandonedStreamBlocks(c, `restreamed as ${event.message?.id}`);
 		c.turnToolCallIds = [];
+		c.turnStreamMessageId = event.message?.id;
+		c.turnStreamOpen = true;
+		c.turnStreamBlockStart = c.turnBlocks.length;
 		if (event.message?.usage) updateUsage(c.turnOutput, event.message.usage, model);
 		return;
 	}
@@ -1384,6 +1395,8 @@ function processStreamEvent(
 		return;
 	}
 
+	if (event?.type === "message_stop") c.turnStreamOpen = false;
+
 	if (event?.type === "message_stop" && c.turnSawToolCall) {
 		// Tool call complete — end this pi stream. The SDK will still yield an
 		// assistant message for this turn, but currentPiStream=null causes
@@ -1406,16 +1419,46 @@ function processStreamEvent(
 	}
 }
 
+/** Remove the blocks a stream Claude Code abandoned mid-message. They never got a
+ *  message_stop, so a thinking block has no signature and a tool call is one CC will
+ *  never dispatch; left in, pi would run the tool and the turn would wait on a
+ *  handler that never comes, or the next request would replay a broken block.
+ *  The fallback then restarts those indices. pi's normal provider path tolerates that;
+ *  pi-agent-core's experimental harness frame encoder keys blocks by contentIndex and
+ *  rejects a repeated start, so it would need a change there to drive this provider. */
+function dropAbandonedStreamBlocks(c: QueryContext, why: string): void {
+	const dropped = c.turnBlocks.splice(c.turnStreamBlockStart);
+	debug(`dropAbandonedStreamBlocks: ${why}; dropped ${dropped.length} blocks from ${c.turnStreamMessageId} types=${dropped.map((b: any) => b.type).join(",")}`);
+	c.turnToolCallIds = [];
+	c.turnSawToolCall = c.turnBlocks.some((b: any) => b.type === "toolCall");
+	c.turnStreamOpen = false;
+}
+
 // The SDK always yields `assistant` messages (completed content blocks) after streaming.
 // When stream_events already delivered the content, this is a no-op. But after
 // resetTurnState (e.g. tool result delivery), if the next turn's assistant message
 // arrives before any stream_events, this is the primary content path. Must maintain
 // the same stream lifecycle as processStreamEvent — including ending the stream on
 // tool_use to prevent deadlock with the MCP handler.
+//
+// It is also the content path when a stream stalls: Claude Code drops it and asks
+// again without streaming ("Error streaming, falling back to non-streaming mode"),
+// and the answer arrives as one assistant message, under a new message id, with no
+// stream_events of its own. turnSawStreamEvent is already set by the dead stream,
+// so gating on it alone dropped that message: its tool calls never reached pi, CC
+// sat in the MCP handler waiting for their results, and the turn hung on "Working"
+// until the user aborted it.
 function processAssistantMessage(message: SDKMessage, model: Model<any>, customToolNameToPi: Map<string, string>, c: QueryContext): void {
-	if (c.turnSawStreamEvent) return;
 	const assistantMsg = (message as any).message;
 	if (!assistantMsg?.content) return;
+	if (c.turnSawStreamEvent) {
+		// Same id was already delivered; a new id is CC's non-streaming fallback.
+		// Drop the stalled stream's partial blocks if it never stopped. Deliberately
+		// deliver even if it stopped, at the risk of duplication if CC renumbers it.
+		const id = assistantMsg.id;
+		if (!id || !c.turnStreamMessageId || id === c.turnStreamMessageId) return;
+		if (c.turnStreamOpen) dropAbandonedStreamBlocks(c, `non-streaming fallback ${id}`);
+	}
 	c.turnToolCallIds = [];
 	debug(`processAssistantMessage fallback: ${assistantMsg.content.length} blocks, types=${assistantMsg.content.map((b: any) => b.type).join(",")}`);
 	for (const block of assistantMsg.content) {
@@ -1689,20 +1732,36 @@ function drainForAbort(c: QueryContext, promptStream: PromptStream): void {
 
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
  *  Two cases: tool result delivery (active query) or fresh query. */
-function streamClaudeAgentSdk(model: Model<any>, input: ProviderInput, options?: SimpleStreamOptions): AssistantMessageEventStream {
+function streamClaudeAgentSdk(model: Model<any>, input: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	showStartupNoticeOnce();
-	const stream = newAssistantMessageEventStream();
-	// Folded before anything positional runs; a shape this host cannot replay fails
-	// the turn on the stream, where a detached low-level caller can see it.
+	// pi hands providers a transcript (prompt/tools folded into system messages) — fold it
+	// back out to the prompt/tools fields every cursor write, syncSharedSession call and
+	// prompt-capture lookup below assumes (issue #106). A transcript that cannot be folded
+	// fails the turn on the stream rather than by throwing: a low-level `agentLoop` caller
+	// reaches this provider from a detached promise, where a throw ends the pi process.
 	let context: Context;
 	try {
-		context = readTranscript(input);
+		context = toBridgeContext(input);
 	} catch (err) {
+		const stream = createAssistantMessageEventStream();
 		stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", errorMessage(err)) });
 		markStreamComplete(stream);
 		stream.end();
 		return stream;
 	}
+
+	// One-off summarizer calls arrive HERE too, not only via isolatedStreamFn: /bug report
+	// (summarizeForBugReport) routes through agent.streamFunction -> streamSimple, with no
+	// takeover hook. pi marks every one-off summarizer with cacheRetention:"none" in
+	// completeSummarization, so route on the marker: their prompt is never recorded by the
+	// capture boundaries and resolveOrDerive would throw. Hand them to the isolated path
+	// (separate persistSession:false CC process, no session sync needed).
+	if (options?.cacheRetention === "none") {
+		debug(`provider: one-off summarizer call (cacheRetention none) routed to isolated summary, msgs=${context.messages.length}`);
+		return isolatedStreamFn(model, context, options);
+	}
+
+	const stream = createAssistantMessageEventStream();
 
 	// DEBUG: trace followUp message triggering
 	const lastMsgRole = context.messages[context.messages.length - 1]?.role;
@@ -1777,9 +1836,19 @@ function streamClaudeAgentSdk(model: Model<any>, input: ProviderInput, options?:
 	// `--no-skills` reach Claude Code by leaving nothing to forward. A sub-agent's
 	// custom override embeds its parent's assembled Pi prompt; recursive projection
 	// replaces that exact inherited prompt with its already-safe portable parts.
+	// Derive the key from the transcript replay (toBridgeContext), NOT from the
+	// recorded keys: under a forced prompt the transcript head is projected via
+	// transformContext after turn_start, so ctx.getSystemPrompt() is not the head.
+	// The projection refuses too, when a part carries pi's harness (issue #88).
 	let promptCapture: PromptCapture | undefined;
+	let systemPromptAppend: string | undefined;
 	try {
 		promptCapture = promptCaptures.resolveOrDerive(context.systemPrompt);
+		systemPromptAppend = promptCapture
+			? projectPromptCapture(promptCapture, {
+				skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
+			})
+			: undefined;
 	} catch (err) {
 		// Refuse through the stream rather than by throwing. The resolver's contract is
 		// unchanged — an unaccountable prompt still fails its turn and reaches Claude
@@ -1791,17 +1860,12 @@ function streamClaudeAgentSdk(model: Model<any>, input: ProviderInput, options?:
 		// Nothing has been claimed or reset at this point, so there is no half-built
 		// query to unwind; see the comment above resolveMcpTools.
 		const msg = errorMessage(err);
-		debug(`provider: refusing turn without a resolvable system prompt: ${msg}`);
+		debug(`provider: refusing turn without a sendable system prompt: ${msg}`);
 		stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
 		markStreamComplete(stream);
 		stream.end();
 		return stream;
 	}
-	const systemPromptAppend = promptCapture
-		? projectPromptCapture(promptCapture, {
-			skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
-		})
-		: undefined;
 
 	// 2. Fresh child context — constructor already gave us clean Maps and empty
 	//    arrays. For a reused top-level context, clear explicitly.
@@ -1815,7 +1879,7 @@ function streamClaudeAgentSdk(model: Model<any>, input: ProviderInput, options?:
 	queryCtx.resetTurnState(model);
 	queryCtx.latestCursor = 0;
 
-	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+	const cwd = process.cwd();
 	// cliModel is the actual id sent to Claude Code (may carry [1m]); model.id is the
 	// pi-registered id. Log cliModel so debug lines reflect what CC actually received.
 	const cliModel = claudeCodeModelId(model, longContextSettings);
@@ -1859,12 +1923,19 @@ function streamClaudeAgentSdk(model: Model<any>, input: ProviderInput, options?:
 	const strictMcpConfigEnabled = providerSettings.strictMcpConfig !== false;
 	const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
 
-	// Prefer the model's own thinkingLevelMap when present (pi-ai 0.72+ ships
-	// per-model overrides — e.g. opus-4-7 wants xhigh→xhigh, not xhigh→max).
-	// Fall back to our generic table for older pi-ai or unmapped levels.
+	// Prefer the model's own thinkingLevelMap (per-model overrides — e.g. a map can
+	// route xhigh→xhigh where the generic table maps xhigh→max). pi-ai's catalog
+	// ships a map for most Claude models; the table below covers models without
+	// one, and the levels a map leaves unnamed. A null entry means the level is
+	// unsupported on that model: no effort argument is sent, so Claude Code's own
+	// default applies rather than the generic table's value. Map values are
+	// provider-generic strings, so a map value is trusted only when it names a
+	// level CC accepts.
+	const mapped = options?.reasoning ? model.thinkingLevelMap?.[options.reasoning] : undefined;
 	const effort = options?.reasoning
-		? ((model as any).thinkingLevelMap?.[options.reasoning] as EffortLevel | undefined)
-			?? REASONING_TO_EFFORT[options.reasoning]
+		? mapped === undefined
+			? REASONING_TO_EFFORT[options.reasoning]
+			: VALID_EFFORTS.has(mapped as EffortLevel) ? mapped as EffortLevel : undefined
 		: undefined;
 
 	const extraArgs: Record<string, string | null> = { model: cliModel };
@@ -2097,7 +2168,7 @@ async function promptAndWait(
 	}
 
 	// Mode → disallowed tools
-	const disallowedTools = MODE_DISALLOWED_TOOLS[mode] ?? [];
+	const disallowedTools = MODE_DISALLOWED_TOOLS[mode];
 
 	// AskClaude uses Claude Code's native Read tool rather than Pi's MCP bridge.
 	// Same resolver as the provider path: a prompt neither recorded nor derivable
@@ -2244,9 +2315,6 @@ async function promptAndWait(
 
 // --- Extension registration ---
 
-const DEFAULT_TOOL_DESCRIPTION_FULL = "Delegate to Claude Code for a second opinion or analysis (code review, architecture questions, debugging theories), or to autonomously handle a task. Defaults to read-only mode — use full mode when the user wants to delegate a task that requires changes. Prefer to handle straightforward tasks yourself.";
-const DEFAULT_TOOL_DESCRIPTION = "Delegate to Claude Code for a second opinion or analysis (code review, architecture questions, debugging theories). Read-only — Claude Code can explore the codebase but not make changes. Prefer to handle straightforward tasks yourself.";
-
 const PREVIEW_MAX_CHARS = 1000;
 const PREVIEW_MAX_LINES = 6;
 
@@ -2260,11 +2328,20 @@ export default function (pi: ExtensionAPI) {
 	debug("loadConfig:", JSON.stringify(config));
 	providerSettings = config.provider ?? {};
 	// We need these settings to know if we're eligible for 1M context on certain models
+	// Validate at the boundary: a non-array here would throw inside every
+	// claudeCodeModelId call and brick the extension at activation.
+	const forceTwoHundredK = Array.isArray(providerSettings.forceTwoHundredK)
+		? providerSettings.forceTwoHundredK.filter((id): id is string => typeof id === "string")
+		: undefined;
 	longContextSettings = {
 		plan: providerSettings.plan ?? "pro",
 		longContextExtraUsage: providerSettings.longContextExtraUsage ?? false,
+		forceTwoHundredK,
 	};
 	const registeredModels = applyLongContext(MODELS, longContextSettings);
+	if (registeredModels.length === 0) {
+		console.error("claude-bridge: no models available from pi-ai's anthropic catalog — update @earendil-works/pi-ai (requires >=0.86.1)");
+	}
 
 	if (!config.startupNoticeShown) {
 		if (config.provider?.plan === undefined) pendingNotices.push('Are you using a Max plan? You need to set provider.plan to "max" to unlock 1M context in Opus.');
@@ -2295,15 +2372,57 @@ export default function (pi: ExtensionAPI) {
 	// `--system-prompt` replaces pi's default rather than adding to it, but Claude
 	// Code's preset carries its own tool and permission guidance that the bridge
 	// still depends on, so both flags are forwarded as an append.
-	pi.on("before_agent_start", (event) => {
-		const options = event.systemPromptOptions;
+	//
+	// The options (custom/append/contextFiles/skills) are pi config, stable across a
+	// turn; only the auto-generated tool list in the rendered prompt varies. Stash them
+	// at before_agent_start so the agent_start recording below can reuse them.
+	type RecordOptions = Parameters<typeof recordSystemPrompt>[2];
+	let lastSystemPromptOptions: RecordOptions | undefined;
+	function recordSystemPrompt(source: string, systemPrompt: string | undefined, options: {
+		customPrompt?: string;
+		appendSystemPrompt?: string;
+		contextFiles?: { path: string; content: string }[];
+		skills?: Parameters<typeof promptCaptures.record>[1]["skills"];
+		selectedTools?: string[];
+	} | undefined) {
+		if (!systemPrompt) return;
 		const hasRead = !options?.selectedTools || options.selectedTools.includes("read");
-		promptCaptures.record(event.systemPrompt, {
+		promptCaptures.record(systemPrompt, {
 			custom: options?.customPrompt,
 			append: options?.appendSystemPrompt,
 			contextFiles: options?.contextFiles ?? [],
 			skills: hasRead ? options?.skills ?? [] : [],
-		});
+		}, source);
+	}
+	pi.on("before_agent_start", (event) => {
+		lastSystemPromptOptions = event.systemPromptOptions;
+		recordSystemPrompt("before_agent_start", event.systemPrompt, event.systemPromptOptions);
+	});
+	// The prompt the provider actually queries with is the fully-widened one: MCP tool
+	// descriptions merge into the system prompt only after their servers connect, which
+	// is after before_agent_start. ctx.getSystemPrompt() returns that widened prompt by
+	// agent_start (verified: before_agent_start=10,988 chars vs agent_start/query=23,479).
+	// A subagent embeds the widened parent prompt verbatim (pi-subagents reads
+	// ctx.getSystemPrompt() at dispatch), so unless the widened prompt is a capture key
+	// too, the child's turn resolves against nothing, falls to a verbatim side request,
+	// and ships pi's harness — tripping the server's third-party plan-eligibility check
+	// ("out of extra usage"). Recording it here, before the query, restores the match.
+	//
+	// agent_start also captures a handler-returned forceSystemPrompt, which
+	// buildSystemPrompt renders verbatim.
+	pi.on("agent_start", (_event, ctx) => {
+		recordSystemPrompt("agent_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
+	});
+
+	// Mid-run re-renders: turn_start fires before every turn (first turn included)
+	// after the turn's prompt is final: prepareNextTurnWithContext has
+	// re-rendered the options (pi's section-based prompt) and any mid-run
+	// setActiveToolsByName rebuild has already landed. Re-keying at each boundary
+	// the prompt can change at keeps exact-match alive mid-run. The stashed options can
+	// lag a mid-run tool-loadout change, which skews the hasRead skills filter until the
+	// next before_agent_start — accepted: a stale skills list beats failing the turn.
+	pi.on("turn_start", (_event, ctx) => {
+		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
 	});
 	pi.on("session_shutdown", () => {
 		reportLeaks("session_shutdown");
@@ -2393,69 +2512,78 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Provider ---
 	//
-	// Guard against re-registration when the module is loaded multiple times
-	// (e.g., when spawning subagents). The shared ModelRegistry would otherwise
-	// overwrite the parent's streamSimple, breaking tool result delivery.
-	// See ACTIVE_STREAM_SIMPLE_KEY for the full mechanism.
+	// Registration policy across module instances (a subagent session can load
+	// this module fresh): the FIRST instance registers unconditionally at load,
+	// which is what puts claude-bridge models in the picker before any session
+	// starts. Later instances decide at session_start, when ctx.modelRegistry
+	// reveals who owns this session's registry:
+	//
+	// - Registry already has the provider (host passes the parent's registry down,
+	//   e.g. pi-subagents >=0.14.3): skip. Re-registering would overwrite the
+	//   parent's pinned streamSimple with this instance's fresh — empty-state —
+	//   stream fn, and the parent's next tool-result delivery would route into it.
+	// - Registry lacks the provider (host gives the child its own, e.g. older
+	//   pi-subagents forks): register, or every claude-bridge/* dispatch in the
+	//   child fails with "Model not found" (#91). Even loading the bridge via the
+	//   agent's `extensions:` frontmatter didn't help there — the module loaded,
+	//   hit the old skip-guard, and the child's registry stayed empty.
+	//
+	// A per-instance stream fn registered into a per-instance registry is
+	// self-consistent: that session's traffic flows through this module state,
+	// which starts clean and serves only that session.
+	//
+	// On session_shutdown (including /reload), clearSession() resets
+	// ACTIVE_STREAM_SIMPLE_KEY so a freshly loaded module can register as first
+	// again.
 
 	const g = globalThis as Record<symbol, any>;
+	const providerConfig = {
+		baseUrl: "claude-bridge",
+		apiKey: "not-used",
+		api: "claude-bridge",
+		models: registeredModels,
+		// Cast: the Provider interface passes a TranscriptContext; the bridge takes plain
+		// Context models (toBridgeContext normalizes at the stream entry points).
+		streamSimple: streamClaudeAgentSdk as any,
+	};
 	if (!g[ACTIVE_STREAM_SIMPLE_KEY]) {
 		// First instance: store our streamSimple and register.
 		g[ACTIVE_STREAM_SIMPLE_KEY] = streamClaudeAgentSdk;
-		pi.registerProvider(PROVIDER_ID, {
-			baseUrl: "claude-bridge",
-			apiKey: "not-used",
-			api: "claude-bridge",
-			models: registeredModels,
-			// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
-			streamSimple: streamClaudeAgentSdk as any,
-		});
+		pi.registerProvider(PROVIDER_ID, providerConfig);
 		// Published for extensions that need the session's own model to answer a
 		// question about the session — session-recap is the first. Symbol.for keeps
 		// it addressable across separately pinned packages, which cannot import each
 		// other: the bridge ships TypeScript with no package entry point.
 		g[RECAP_FORK_KEY] = { ...(g[RECAP_FORK_KEY] ?? {}), [PROVIDER_ID]: { ask: askForkedSession } };
 	} else {
-		// Subsequent instance (subagent session): skip registration entirely.
-		// The subagent already has access to claude-bridge models via the shared
-		// ModelRegistry from the parent's registration. Calls to those models
-		// route through the parent's streamSimple via reentrant QueryContexts.
-		debug(`provider: skipping re-registration, parent instance active (module=${moduleInstanceId})`);
+		// Later instance: register only if this session's registry lacks the provider.
+		debug(`provider: deferring registration decision to session_start (module=${moduleInstanceId})`);
+		pi.on("session_start", (_event, ctx) => {
+			if (ctx.modelRegistry.getProvider(PROVIDER_ID)) {
+				debug(`provider: registry already has ${PROVIDER_ID}, skipping registration (module=${moduleInstanceId})`);
+				return;
+			}
+			debug(`provider: registry lacks ${PROVIDER_ID}, registering (module=${moduleInstanceId})`);
+			pi.registerProvider(PROVIDER_ID, providerConfig);
+		});
 	}
 
 	// --- AskClaude tool ---
 
 	const askConf = config.askClaude;
-	const allowFull = askConf?.allowFullMode !== false;
-	const defaultMode = askConf?.defaultMode ?? "read";
-	const defaultIsolated = askConf?.defaultIsolated ?? false;
+	const askDefaults = resolveAskClaudeDefaults(askConf);
 	askClaudeToolName = askConf?.name ?? "AskClaude";
 
-	const modeValues = allowFull ? ["read", "full", "none"] as const : ["read", "none"] as const;
-	let modeDesc = `"read" (default): questions about the codebase — review, analysis, explain. "none": general knowledge only (no file access).`;
-	if (allowFull) modeDesc += ` "full": allows writing and bash execution (careful: runs without feedback to pi).`;
-
 	if (askConf?.enabled) {
-		const askClaudeParams = Type.Object({
-			prompt: Type.String({ description: "The question or task for Claude Code. By default Claude sees the full conversation history. Don't research up front, let Claude explore." }),
-			mode: Type.Optional(StringEnum(modeValues, { description: modeDesc })),
-			model: Type.Optional(Type.String({ description: 'Claude model (e.g. "opus", "sonnet", "haiku", or full ID). Defaults to "opus".' })),
-			thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const, { description: "Thinking effort level. Omit to use Claude Code's default." })),
-			isolated: Type.Optional(Type.Boolean({ description: "When true, Claude sees only this prompt (clean session). When false (default), Claude sees the full conversation history." })),
-		});
+		const askClaudeParams = buildAskClaudeParams(askDefaults);
 		pi.registerTool<typeof askClaudeParams>({
 			name: askConf?.name ?? "AskClaude",
 			label: askConf?.label ?? "Ask Claude Code",
-			description: askConf?.description ?? (allowFull ? DEFAULT_TOOL_DESCRIPTION_FULL : DEFAULT_TOOL_DESCRIPTION),
+			description: askClaudeToolDescription(askDefaults, askConf?.description),
 			parameters: askClaudeParams,
 			renderCall(args, theme) {
 				let text = theme.fg("mdLink", theme.bold("AskClaude "));
-				const mode = args.mode ?? defaultMode;
-				const tags: string[] = [];
-				if (mode !== defaultMode) tags.push(`mode=${mode}`);
-				if (args.model) tags.push(`model=${args.model}`);
-				if (args.thinking) tags.push(`thinking=${args.thinking}`);
-				if (args.isolated) tags.push("isolated");
+				const tags = askClaudeCallTags(args, askDefaults);
 				if (tags.length) text += `${theme.fg("accent", `[${tags.join(", ")}]`)} `;
 				const truncated = args.prompt.length > PREVIEW_MAX_CHARS ? args.prompt.substring(0, PREVIEW_MAX_CHARS) : args.prompt;
 				const lines = truncated.split("\n").slice(0, PREVIEW_MAX_LINES);
@@ -2503,8 +2631,8 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				const mode = (params.mode ?? defaultMode) as "full" | "read" | "none";
-				const isolated = params.isolated ?? defaultIsolated;
+				const mode = resolveAskClaudeMode(params.mode, askDefaults);
+				const isolated = params.isolated ?? askDefaults.isolated;
 				const toolCalls = new Map<string, ToolCallState>();
 				const start = Date.now();
 
@@ -2525,7 +2653,7 @@ export default function (pi: ExtensionAPI) {
 						model: params.model,
 						thinking: params.thinking,
 						isolated,
-						context: isolated ? undefined : readTranscript({ messages: buildSessionContext(ctx.sessionManager.getBranch()).messages as Context["messages"] }).messages,
+						context: isolated ? undefined : buildSessionContext(ctx.sessionManager.getBranch()).messages as Context["messages"],
 					});
 					clearInterval(progressInterval);
 					onUpdate?.({ content: [{ type: "text", text: "" }], details: {} });

@@ -28,6 +28,13 @@ const BRIDGE_MODEL = "claude-bridge/claude-haiku-4-5";
 const WORD_A = `alpha${Math.random().toString(36).slice(2, 6)}`;
 const WORD_B = `beta${Math.random().toString(36).slice(2, 6)}`;
 const WORD_C = `gamma${Math.random().toString(36).slice(2, 6)}`;
+// The AskClaude turns run after the first provider exchange only: once the
+// transcript holds a second "recall the words" exchange, the API refuses the
+// request ("safeguards flagged this message" / "[reasoning_extraction]")
+// regardless of how the question is phrased. This code is stated only by the
+// user, so it tests shared context without the assistant reproducing its own
+// prior output.
+const CODE = `code${Math.random().toString(36).slice(2, 6)}`;
 
 const TEST_CWD_PREFIX = join(tmpdir(), "pi-claude-bridge-session-resume-");
 const TEST_CWD = mkdtempSync(TEST_CWD_PREFIX);
@@ -94,7 +101,7 @@ await startAndWait();
 try {
   // Turn 1: Non-provider prompt — establishes context before our provider is used
   console.log("Turn 1: Non-provider prompt (establish context)...");
-  const text1 = await promptAndWait(`The first word is '${WORD_A}'. Acknowledge and be very brief.`);
+  const text1 = await promptAndWait(`The first word is '${WORD_A}'. The access code is '${CODE}'. Acknowledge and be very brief.`);
   if (!text1) throw new Error("Turn 1 produced no text");
   console.log(`  Response: ${text1.slice(0, 80)}`);
 
@@ -114,46 +121,53 @@ try {
   if (!lower2.includes(WORD_A)) throw new Error(`Turn 2 response missing '${WORD_A}': ${text2}`);
   if (!lower2.includes(WORD_B)) throw new Error(`Turn 2 response missing '${WORD_B}': ${text2}`);
 
-  // Switch to other model — creates missed messages
+  // Turn 3: AskClaude shared mode — should see CODE, which the non-provider model was told
   console.log(`Switching to ${OTHER_PROVIDER}/${OTHER_MODEL}...`);
   await send({ type: "set_model", provider: OTHER_PROVIDER, modelId: OTHER_MODEL });
 
-  // Turn 3: Non-provider prompt — adds context that provider must see on switch-back
-  console.log("Turn 3: Non-provider prompt (creates missed messages)...");
-  const text3 = await promptAndWait(`The third word is '${WORD_C}'. Acknowledge and be very brief.`);
-  if (!text3) throw new Error("Turn 3 produced no text");
-  console.log(`  Response: ${text3.slice(0, 80)}`);
+  console.log("Turn 3: AskClaude shared mode (should see non-provider context)...");
+  const text3 = await promptAndWait(
+    'Use the AskClaude tool with prompt="What is the access code? Reply with just the code."'
+  );
+  console.log(`  AskClaude args: ${JSON.stringify(lastToolArgs)}`);
+  console.log(`  AskClaude result: ${(lastToolResult || "").slice(0, 120)}`);
+  if (promptContains(CODE)) {
+    console.log(`  INCONCLUSIVE: ${OTHER_MODEL} put '${CODE}' in the prompt, so a correct answer proves nothing about shared context`);
+  } else if (!lastToolResult?.toLowerCase().includes(CODE)) {
+    throw new Error(`Turn 3 AskClaude tool result missing '${CODE}': ${lastToolResult}`);
+  }
+
+  // Turn 4: AskClaude isolated mode — should NOT see conversation history
+  console.log("Turn 4: AskClaude isolated mode (should not see context)...");
+  lastToolResult = null;
+  const text4 = await promptAndWait(
+    'Use the AskClaude tool with prompt="What is the access code? If you don\'t know, say UNKNOWN." and isolated=true'
+  );
+  console.log(`  AskClaude args: ${JSON.stringify(lastToolArgs)}`);
+  console.log(`  AskClaude result: ${(lastToolResult || "").slice(0, 120)}`);
+  if (promptContains(CODE)) {
+    // The ~1-in-5 flake: isolated CC is echoing a code it was handed, not one it
+    // recovered from a session it should not have seen.
+    console.log(`  INCONCLUSIVE: ${OTHER_MODEL} put '${CODE}' in the prompt, so isolation cannot be judged from the response`);
+  } else if (lastToolResult?.toLowerCase().includes(CODE)) {
+    throw new Error(`Turn 4 isolated AskClaude should not know '${CODE}' (not in its prompt, so this is a real context leak): ${lastToolResult}`);
+  }
+
+  // Turn 5: Non-provider prompt — adds context that provider must see on switch-back
+  console.log("Turn 5: Non-provider prompt (creates missed messages)...");
+  const text5 = await promptAndWait(`The third word is '${WORD_C}'. Acknowledge and be very brief.`);
+  if (!text5) throw new Error("Turn 5 produced no text");
+  console.log(`  Response: ${text5.slice(0, 80)}`);
 
   // Switch back to provider — context includes all prior turns (Case 4)
   console.log(`Switching back to ${BRIDGE_MODEL}...`);
   await send({ type: "set_model", provider: bridgeProvider, modelId: bridgeModelId });
 
 
-  // Turn 4: Provider resumes with missed messages (Case 4)
-  console.log("Turn 4: Provider resume with missed messages (Case 4)...");
-  const text4 = await promptAndWait(
-    "What were all three words? Reply with just the three words separated by commas."
-  );
-  console.log(`  Response: ${text4.slice(0, 80)}`);
-  const lower4 = text4.toLowerCase();
-  if (!lower4.includes(WORD_A)) throw new Error(`Turn 4 response missing '${WORD_A}': ${text4}`);
-  if (!lower4.includes(WORD_B)) throw new Error(`Turn 4 response missing '${WORD_B}': ${text4}`);
-  if (!lower4.includes(WORD_C)) throw new Error(`Turn 4 response missing '${WORD_C}': ${text4}`);
-
-  // Turn 5: Abort mid-stream — session should be invalidated, next turn should recover
-  console.log("Turn 5: Abort mid-stream (session recovery)...");
-  await send({ type: "prompt", message: "Write a detailed 500-word essay about the history of timekeeping." });
-  // Set up idle listener before abort so we don't miss agent_end
-  const idle5 = waitForIdle();
-  await new Promise((r) => setTimeout(r, 2000));
-  await send({ type: "abort" });
-  await idle5;
-
-
-  // Turn 6: Provider turn after abort — should NOT get "conversation not found"
-  console.log("Turn 6: Provider turn after abort (should recover)...");
+  // Turn 6: Provider resumes with missed messages (Case 4)
+  console.log("Turn 6: Provider resume with missed messages (Case 4)...");
   const text6 = await promptAndWait(
-    "What were all three words from earlier? Reply with just the three words separated by commas."
+    "What were all three words? Reply with just the three words separated by commas."
   );
   console.log(`  Response: ${text6.slice(0, 80)}`);
   const lower6 = text6.toLowerCase();
@@ -161,38 +175,26 @@ try {
   if (!lower6.includes(WORD_B)) throw new Error(`Turn 6 response missing '${WORD_B}': ${text6}`);
   if (!lower6.includes(WORD_C)) throw new Error(`Turn 6 response missing '${WORD_C}': ${text6}`);
 
-  // Turn 7: AskClaude shared mode — should see WORD_C which was only told to the non-provider model
-  console.log(`Switching to ${OTHER_PROVIDER}/${OTHER_MODEL}...`);
-  await send({ type: "set_model", provider: OTHER_PROVIDER, modelId: OTHER_MODEL });
+  // Turn 7: Abort mid-stream — session should be invalidated, next turn should recover
+  console.log("Turn 7: Abort mid-stream (session recovery)...");
+  await send({ type: "prompt", message: "Write a detailed 500-word essay about the history of timekeeping." });
+  // Set up idle listener before abort so we don't miss agent_end
+  const idle7 = waitForIdle();
+  await new Promise((r) => setTimeout(r, 2000));
+  await send({ type: "abort" });
+  await idle7;
 
 
-  console.log("Turn 7: AskClaude shared mode (should see non-provider context)...");
-  const text7 = await promptAndWait(
-    'Use the AskClaude tool with prompt="What was the third word mentioned earlier? Reply with just the word."'
-  );
-  console.log(`  AskClaude args: ${JSON.stringify(lastToolArgs)}`);
-  console.log(`  AskClaude result: ${(lastToolResult || "").slice(0, 120)}`);
-  if (promptContains(WORD_C)) {
-    console.log(`  INCONCLUSIVE: ${OTHER_MODEL} put '${WORD_C}' in the prompt, so a correct answer proves nothing about shared context`);
-  } else if (!lastToolResult?.toLowerCase().includes(WORD_C)) {
-    throw new Error(`Turn 7 AskClaude tool result missing '${WORD_C}': ${lastToolResult}`);
-  }
-
-  // Turn 8: AskClaude isolated mode — should NOT see conversation history
-  console.log("Turn 8: AskClaude isolated mode (should not see context)...");
-  lastToolResult = null;
+  // Turn 8: Provider turn after abort — should NOT get "conversation not found"
+  console.log("Turn 8: Provider turn after abort (should recover)...");
   const text8 = await promptAndWait(
-    'Use the AskClaude tool with prompt="What was the third word mentioned earlier? If you don\'t know, say UNKNOWN." and isolated=true'
+    "What were all three words? Reply with just the three words separated by commas."
   );
-  console.log(`  AskClaude args: ${JSON.stringify(lastToolArgs)}`);
-  console.log(`  AskClaude result: ${(lastToolResult || "").slice(0, 120)}`);
-  if (promptContains(WORD_C)) {
-    // The ~1-in-5 flake: isolated CC is echoing a word it was handed, not one it
-    // recovered from a session it should not have seen.
-    console.log(`  INCONCLUSIVE: ${OTHER_MODEL} put '${WORD_C}' in the prompt, so isolation cannot be judged from the response`);
-  } else if (lastToolResult?.toLowerCase().includes(WORD_C)) {
-    throw new Error(`Turn 8 isolated AskClaude should not know '${WORD_C}' (not in its prompt, so this is a real context leak): ${lastToolResult}`);
-  }
+  console.log(`  Response: ${text8.slice(0, 80)}`);
+  const lower8 = text8.toLowerCase();
+  if (!lower8.includes(WORD_A)) throw new Error(`Turn 8 response missing '${WORD_A}': ${text8}`);
+  if (!lower8.includes(WORD_B)) throw new Error(`Turn 8 response missing '${WORD_B}': ${text8}`);
+  if (!lower8.includes(WORD_C)) throw new Error(`Turn 8 response missing '${WORD_C}': ${text8}`);
 
   // sessionId stability: sessionId should stay stable across normal
   // rebuilds (Case 2 → Case 4 → Case 3). It's allowed to rotate exactly
@@ -201,7 +203,7 @@ try {
   // writes (which would otherwise append an orphan record at the same
   // path and break the parent-uuid chain for the next resume).
   //
-  // This test exercises one abort (Turn 5), so we expect exactly 2 unique
+  // This test exercises one abort (Turn 7), so we expect exactly 2 unique
   // sessionIds: pre-abort and post-abort.
   const debugLog = readFileSync(DEBUG_LOG, "utf8");
   const sessionIds = new Set();
@@ -229,4 +231,3 @@ try {
     rmSync(TEST_CWD, { recursive: true, force: true });
   }
 }
-
